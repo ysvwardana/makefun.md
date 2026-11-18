@@ -68,8 +68,9 @@ export const AVAILABLE_MODELS: ModelOption[] = [
     id: 'openai-compatible-custom',
     label: 'OpenAI-Compatible Endpoint',
     provider: 'openai_compatible',
-    tier: 'free',
-    description: 'Local or free OpenAI-compatible server (e.g., Ollama, vLLM, OpenRouter free models).',
+    tier: 'depends_on_endpoint',
+    description:
+      'Local or allowlisted OpenAI-compatible server (cost depends on target endpoint: local Ollama is $0; external gateways may bill).',
     supportsGrounding: false,
   },
 ];

@@ -5,6 +5,13 @@ import { crud } from './crud.ts';
 import { AVAILABLE_MODELS } from './db.ts';
 import { extractLeaderboardInsights } from './makefun.ts';
 import {
+  getMaxLlmOutputTokens,
+  isServerPaidLlmAuthorized,
+  SecurityPolicyError,
+  validateOpenAICompatBaseUrl,
+  withLlmExecutionGuard,
+} from './security.ts';
+import {
   buildMasterMarkdown,
   extractOfficialBountySkills,
   mergeRecommendedSkills,
@@ -13,10 +20,20 @@ import type {
   AIAnalysisRecord,
   BountyRecord,
   BountySnapshot,
+  LLMConnectionTestReport,
   LLMProviderId,
   RecommendedSkill,
   ResearchReference,
 } from '../src/types/command-center.ts';
+
+export const DEFAULT_OPENAI_COMPAT_BASE_URL = 'http://localhost:11434/v1';
+export const DEFAULT_OPENAI_COMPAT_MODEL = 'llama3.1:8b';
+export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
+
+const MAX_SUCCESS_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MB cap
+const MAX_ERROR_RESPONSE_BYTES = 32 * 1024; // 32 KB cap
+const PROBE_TIMEOUT_MS = 12_000;
+const SYNTHESIS_TIMEOUT_MS = 45_000;
 
 const PAID_GEMINI_MODELS = new Set(['gemini-4-argon', 'gemini-4-carbon']);
 
@@ -69,7 +86,7 @@ function createGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     throw new LLMConfigurationError(
-      'GEMINI_API_KEY is not configured on the server. Set GEMINI_API_KEY in Settings > Secrets (or switch to a local OpenAI-compatible endpoint in Settings).',
+      'GEMINI_API_KEY is not configured on the server. Set GEMINI_API_KEY in server environment variables or local .env file (read-only status shown in Settings).',
       400
     );
   }
@@ -81,6 +98,22 @@ function createGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new LLMConfigurationError(`${label} timed out after ${timeoutMs}ms.`, 504));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function withTransientRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
@@ -95,25 +128,144 @@ async function withTransientRetry<T>(fn: () => Promise<T>, maxRetries = 2): Prom
       if (!isTransient || attempt === maxRetries) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+      const backoffMs = 1200 * Math.pow(2, attempt);
+      await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
   throw lastErr;
 }
 
-function validateModelAuthorization(provider: LLMProviderId, model: string, allowPaidRequests: boolean): void {
+export function validateModelAuthorization(
+  provider: LLMProviderId,
+  model: string,
+  allowPaidRequests: boolean
+): void {
   if (provider === 'gemini') {
     const valid = AVAILABLE_MODELS.some((m) => m.provider === 'gemini' && m.id === model);
     if (!valid) {
-      throw new LLMConfigurationError(`Unsupported Gemini model "${model}". Choose a supported model in Settings.`, 400);
+      throw new LLMConfigurationError(
+        `Unsupported Gemini model "${model}". Choose a supported model in Settings.`,
+        400
+      );
     }
     if (PAID_GEMINI_MODELS.has(model) && !allowPaidRequests) {
       throw new LLMConfigurationError(
-        `Model "${model}" is a paid-tier model and paid requests are disabled. Enable explicit paid authorization in Settings or choose a free-tier model (e.g. gemini-4-hydrogen).`,
+        `Model "${model}" is a paid-tier model and server paid policy is disabled. Set ALLOW_PAID_LLM_REQUESTS=true on the server or choose a free-tier model (e.g. ${DEFAULT_GEMINI_MODEL}).`,
         403
       );
     }
+  } else {
+    if (!model.trim()) {
+      throw new LLMConfigurationError('OpenAI-compatible model name cannot be empty.', 400);
+    }
   }
+}
+
+export interface ResolvedRuntimeLLMConfig {
+  provider: LLMProviderId;
+  geminiModel: string;
+  openaiCompatBaseUrl: string;
+  openaiCompatModel: string;
+  activeModel: string;
+  allowPaidRequests: boolean;
+  enableSearchGrounding: boolean;
+}
+
+/**
+ * Single authoritative configuration resolver shared by GET /api/settings,
+ * connection/capability probes, and production enhancement workflow.
+ */
+export function resolveRuntimeLLMConfig(overrides?: {
+  provider?: LLMProviderId;
+  model?: string;
+  openaiCompatBaseUrl?: string;
+  openaiCompatModel?: string;
+  enableGrounding?: boolean;
+}): ResolvedRuntimeLLMConfig {
+  const providerRaw = overrides?.provider ?? (crud.getSettingValue('provider') as LLMProviderId);
+  const provider: LLMProviderId = providerRaw === 'openai_compatible' ? 'openai_compatible' : 'gemini';
+
+  const savedGeminiModel = (crud.getSettingValue('model') || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
+  const savedCompatBaseUrl =
+    (crud.getSettingValue('openaiCompatBaseUrl') || DEFAULT_OPENAI_COMPAT_BASE_URL).trim() ||
+    DEFAULT_OPENAI_COMPAT_BASE_URL;
+  const savedCompatModel =
+    (crud.getSettingValue('openaiCompatModel') || DEFAULT_OPENAI_COMPAT_MODEL).trim() ||
+    DEFAULT_OPENAI_COMPAT_MODEL;
+
+  const geminiModel =
+    provider === 'gemini' && overrides?.model ? overrides.model.trim() : savedGeminiModel;
+  const openaiCompatModel =
+    overrides?.openaiCompatModel?.trim() ||
+    (provider === 'openai_compatible' && overrides?.model ? overrides.model.trim() : savedCompatModel);
+  const openaiCompatBaseUrl = (overrides?.openaiCompatBaseUrl ?? savedCompatBaseUrl).trim();
+
+  // Paid authorization is strictly server-side policy via environment variable
+  const allowPaidRequests = isServerPaidLlmAuthorized();
+  const enableSearchGrounding =
+    overrides?.enableGrounding ?? crud.getSettingValue('enableSearchGrounding') === 'true';
+
+  const activeModel = provider === 'gemini' ? geminiModel : openaiCompatModel;
+
+  return {
+    provider,
+    geminiModel,
+    openaiCompatBaseUrl,
+    openaiCompatModel,
+    activeModel,
+    allowPaidRequests,
+    enableSearchGrounding,
+  };
+}
+
+async function readResponseTextWithLimit(res: Response, maxBytes: number): Promise<string> {
+  const contentLengthHeader = res.headers.get('content-length');
+  if (contentLengthHeader) {
+    const declaredBytes = Number(contentLengthHeader);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      throw new LLMConfigurationError(
+        `Provider response exceeded maximum allowed size (${maxBytes} bytes).`,
+        502
+      );
+    }
+  }
+
+  if (!res.body) {
+    const text = await res.text();
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new LLMConfigurationError(
+        `Provider response exceeded maximum allowed size (${maxBytes} bytes).`,
+        502
+      );
+    }
+    return text;
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new LLMConfigurationError(
+            `Provider response exceeded maximum allowed size (${maxBytes} bytes).`,
+            502
+          );
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
 }
 
 async function runOpenAICompatibleChat(params: {
@@ -122,17 +274,31 @@ async function runOpenAICompatibleChat(params: {
   systemPrompt: string;
   userPrompt: string;
   jsonMode?: boolean;
+  attachConfiguredCredential: boolean;
+  timeoutMs?: number;
+  maxTokens?: number;
 }): Promise<{ text: string; usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number } }> {
-  const cleanBase = params.baseUrl.replace(/\/$/, '');
-  if (!cleanBase) {
-    throw new LLMConfigurationError('OpenAI-compatible Base URL is empty. Configure it in Settings.', 400);
+  let cleanBase: string;
+  try {
+    cleanBase = await validateOpenAICompatBaseUrl(params.baseUrl);
+  } catch (err) {
+    if (err instanceof SecurityPolicyError) {
+      throw new LLMConfigurationError(err.message, err.statusCode);
+    }
+    throw err;
   }
-  const apiKey = process.env.OPENAI_COMPAT_API_KEY?.trim();
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
+  // Only attach server credential when connecting to the persisted server-configured endpoint
+  if (params.attachConfiguredCredential) {
+    const apiKey =
+      process.env.OPENAI_COMPAT_API_KEY?.trim() ||
+      (typeof crud !== 'undefined' ? crud.getSettingValue('openaiCompatApiKey')?.trim() : '');
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
   }
 
   const body: Record<string, unknown> = {
@@ -141,10 +307,15 @@ async function runOpenAICompatibleChat(params: {
       { role: 'system', content: params.systemPrompt },
       { role: 'user', content: params.userPrompt },
     ],
+    max_tokens: params.maxTokens ?? getMaxLlmOutputTokens(),
   };
   if (params.jsonMode) {
     body.response_format = { type: 'json_object' };
   }
+
+  const timeoutMs = params.timeoutMs ?? SYNTHESIS_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
   try {
@@ -152,16 +323,23 @@ async function runOpenAICompatibleChat(params: {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
+      signal: controller.signal,
+      redirect: 'error',
     });
   } catch (err) {
+    const isAbort = err instanceof Error && err.name === 'AbortError';
     throw new LLMConfigurationError(
-      `Failed to connect to OpenAI-compatible endpoint (${cleanBase}): ${err instanceof Error ? err.message : 'Network error'}`,
-      502
+      isAbort
+        ? `OpenAI-compatible endpoint (${cleanBase}) timed out after ${timeoutMs}ms.`
+        : `Failed to connect to OpenAI-compatible endpoint (${cleanBase}): ${err instanceof Error ? err.message : 'Network error'}`,
+      isAbort ? 504 : 502
     );
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!res.ok) {
-    const errText = await res.text().catch(() => '');
+    const errText = await readResponseTextWithLimit(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '');
     const status = res.status === 429 ? 429 : res.status >= 400 && res.status < 500 ? res.status : 502;
     throw new LLMConfigurationError(
       `OpenAI-compatible provider returned HTTP ${res.status}: ${errText.slice(0, 300)}`,
@@ -169,10 +347,17 @@ async function runOpenAICompatibleChat(params: {
     );
   }
 
-  const data = (await res.json()) as {
+  const rawJsonText = await readResponseTextWithLimit(res, MAX_SUCCESS_RESPONSE_BYTES);
+  let data: {
     choices?: Array<{ message?: { content?: string } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   };
+  try {
+    data = JSON.parse(rawJsonText);
+  } catch {
+    throw new LLMConfigurationError('OpenAI-compatible provider returned invalid JSON payload.', 502);
+  }
+
   const text = data.choices?.[0]?.message?.content?.trim();
   if (!text) {
     throw new LLMConfigurationError('OpenAI-compatible provider returned an empty response.', 502);
@@ -195,62 +380,229 @@ export async function testLLMConnection(overrides?: {
   model?: string;
   openaiCompatBaseUrl?: string;
   openaiCompatModel?: string;
-  allowPaidRequests?: boolean;
-}): Promise<{ ok: boolean; provider: LLMProviderId; model: string; reply: string; latencyMs: number }> {
-  const provider = overrides?.provider ?? ((crud.getSettingValue('provider') as LLMProviderId) || 'gemini');
-  const allowPaid = overrides?.allowPaidRequests ?? crud.getSettingValue('allowPaidRequests') === 'true';
-  const model =
-    provider === 'gemini'
-      ? overrides?.model ?? (crud.getSettingValue('model') || 'gemini-4-hydrogen')
-      : overrides?.openaiCompatModel ?? (crud.getSettingValue('openaiCompatModel') || 'llama3.1:8b');
-  const baseUrl = overrides?.openaiCompatBaseUrl ?? crud.getSettingValue('openaiCompatBaseUrl');
+  mode?: 'connectivity' | 'full';
+}): Promise<LLMConnectionTestReport> {
+  const savedConfig = resolveRuntimeLLMConfig();
+  const effective = resolveRuntimeLLMConfig(overrides);
 
-  validateModelAuthorization(provider, model, allowPaid);
+  validateModelAuthorization(effective.provider, effective.activeModel, effective.allowPaidRequests);
 
-  const startedAt = Date.now();
-  if (provider === 'gemini') {
-    const ai = createGeminiClient();
-    try {
-      const response = await withTransientRetry(() =>
-        ai.models.generateContent({
-          model,
-          contents: 'Reply with exactly: COSMICLABS_LLM_READY',
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+  const testMode = overrides?.mode ?? 'full';
+
+  try {
+    return await withLlmExecutionGuard(async () => {
+      const startedAt = Date.now();
+      if (effective.provider === 'gemini') {
+        const ai = createGeminiClient();
+        try {
+          const response = await withTimeout(
+            withTransientRetry(() =>
+              ai.models.generateContent({
+                model: effective.geminiModel,
+                contents: 'Reply with exactly: COSMICLABS_LLM_READY',
+                config: {
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                  maxOutputTokens: 64,
+                },
+              })
+            ),
+            PROBE_TIMEOUT_MS,
+            'Gemini connectivity probe'
+          );
+          const reply = (response.text || '').trim();
+          if (!reply) {
+            throw new LLMConfigurationError('Gemini returned an empty response during connectivity check.', 502);
+          }
+          const connLatency = Date.now() - startedAt;
+
+          if (testMode === 'connectivity') {
+            return {
+              ok: true,
+              provider: 'gemini',
+              model: effective.geminiModel,
+              reply,
+              latencyMs: connLatency,
+              connectivity: { ok: true, latencyMs: connLatency, detail: 'Reachable' },
+              capability: {
+                ok: true,
+                jsonModeSupported: false,
+                structuredSchemaSupported: false,
+                thinkingSupported: false,
+                groundingConfigured: effective.enableSearchGrounding,
+                detail: 'Capability probe skipped (connectivity-only mode).',
+              },
+            };
+          }
+
+          // Production capability check: responseSchema + ThinkingLevel matching synthesis
+          let capOk = false;
+          let capDetail = '';
+          try {
+            const capRes = await withTimeout(
+              withTransientRetry(() =>
+                ai.models.generateContent({
+                  model: effective.geminiModel,
+                  contents: 'Return strict JSON confirming schema & thinking support.',
+                  config: {
+                    responseMimeType: 'application/json',
+                    thinkingConfig: {
+                      thinkingLevel:
+                        effective.geminiModel === 'gemini-3.1-flash-lite'
+                          ? ThinkingLevel.MEDIUM
+                          : ThinkingLevel.HIGH,
+                    },
+                    maxOutputTokens: 256,
+                    responseSchema: {
+                      type: Type.OBJECT,
+                      properties: {
+                        status: { type: Type.STRING },
+                        schemaSupported: { type: Type.BOOLEAN },
+                      },
+                      required: ['status', 'schemaSupported'],
+                    },
+                  },
+                })
+              ),
+              PROBE_TIMEOUT_MS,
+              'Gemini capability probe'
+            );
+            const parsed = JSON.parse((capRes.text || '').trim()) as {
+              status?: string;
+              schemaSupported?: boolean;
+            };
+            capOk = Boolean(parsed && parsed.status && typeof parsed.schemaSupported === 'boolean');
+            capDetail = capOk
+              ? `Verified responseSchema + ThinkingConfig${effective.enableSearchGrounding ? ' (Search grounding enabled)' : ''}.`
+              : 'Structured schema payload incomplete.';
+          } catch (capErr) {
+            capOk = false;
+            capDetail = `Capability probe failed: ${capErr instanceof Error ? capErr.message : String(capErr)}`;
+          }
+
+          return {
+            ok: capOk,
+            provider: 'gemini',
+            model: effective.geminiModel,
+            reply,
+            latencyMs: Date.now() - startedAt,
+            connectivity: {
+              ok: true,
+              latencyMs: connLatency,
+              detail: 'Gemini API reachable.',
+            },
+            capability: {
+              ok: capOk,
+              jsonModeSupported: capOk,
+              structuredSchemaSupported: capOk,
+              thinkingSupported: capOk,
+              groundingConfigured: effective.enableSearchGrounding,
+              detail: capDetail,
+            },
+          };
+        } catch (err) {
+          if (err instanceof LLMConfigurationError) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const status = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') ? 429 : 502;
+          throw new LLMConfigurationError(`Gemini connection check failed: ${msg}`, status);
+        }
+      } else {
+        // Never transmit stored OPENAI_COMPAT_API_KEY to an unsaved override URL
+        const validatedTargetUrl = await validateOpenAICompatBaseUrl(effective.openaiCompatBaseUrl);
+        const validatedSavedUrl = await validateOpenAICompatBaseUrl(savedConfig.openaiCompatBaseUrl).catch(
+          () => ''
+        );
+        const matchesSavedUrl = validatedTargetUrl === validatedSavedUrl;
+
+        const connResult = await runOpenAICompatibleChat({
+          baseUrl: validatedTargetUrl,
+          model: effective.openaiCompatModel,
+          systemPrompt: 'You are a diagnostic connectivity responder.',
+          userPrompt: 'Reply with exactly: COSMICLABS_LLM_READY',
+          attachConfiguredCredential: matchesSavedUrl,
+          timeoutMs: PROBE_TIMEOUT_MS,
+          maxTokens: 64,
+        });
+        const connLatency = Date.now() - startedAt;
+
+        if (testMode === 'connectivity') {
+          return {
+            ok: true,
+            provider: 'openai_compatible',
+            model: effective.openaiCompatModel,
+            reply: connResult.text,
+            latencyMs: connLatency,
+            connectivity: {
+              ok: true,
+              latencyMs: connLatency,
+              detail: matchesSavedUrl
+                ? 'Endpoint reachable.'
+                : 'Endpoint reachable (server API key withheld for unsaved URL override).',
+            },
+            capability: {
+              ok: true,
+              jsonModeSupported: false,
+              structuredSchemaSupported: false,
+              thinkingSupported: false,
+              groundingConfigured: false,
+              detail: 'Capability probe skipped (connectivity-only mode).',
+            },
+          };
+        }
+
+        // Production capability check: JSON mode
+        let jsonOk = false;
+        let capDetail = '';
+        try {
+          const capRes = await runOpenAICompatibleChat({
+            baseUrl: validatedTargetUrl,
+            model: effective.openaiCompatModel,
+            systemPrompt: 'Respond ONLY with valid JSON: {"status":"ok","jsonMode":true}',
+            userPrompt: 'Verify JSON object mode.',
+            jsonMode: true,
+            attachConfiguredCredential: matchesSavedUrl,
+            timeoutMs: PROBE_TIMEOUT_MS,
+            maxTokens: 128,
+          });
+          const cleaned = capRes.text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+          const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+          jsonOk = Boolean(parsed && typeof parsed === 'object');
+          capDetail = jsonOk
+            ? `Verified JSON object mode.${matchesSavedUrl ? '' : ' Note: save URL before expecting server API key usage.'}`
+            : 'Endpoint did not return valid JSON object.';
+        } catch (capErr) {
+          jsonOk = false;
+          capDetail = `JSON mode capability check failed: ${capErr instanceof Error ? capErr.message : String(capErr)}`;
+        }
+
+        return {
+          ok: jsonOk,
+          provider: 'openai_compatible',
+          model: effective.openaiCompatModel,
+          reply: connResult.text,
+          latencyMs: Date.now() - startedAt,
+          connectivity: {
+            ok: true,
+            latencyMs: connLatency,
+            detail: matchesSavedUrl
+              ? 'Endpoint reachable.'
+              : 'Endpoint reachable (server API key withheld for unsaved URL override).',
           },
-        })
-      );
-      const reply = (response.text || '').trim();
-      if (!reply) {
-        throw new LLMConfigurationError('Gemini returned an empty response during connection check.', 502);
+          capability: {
+            ok: jsonOk,
+            jsonModeSupported: jsonOk,
+            structuredSchemaSupported: false,
+            thinkingSupported: false,
+            groundingConfigured: false,
+            detail: capDetail,
+          },
+        };
       }
-      return {
-        ok: true,
-        provider,
-        model,
-        reply,
-        latencyMs: Date.now() - startedAt,
-      };
-    } catch (err) {
-      if (err instanceof LLMConfigurationError) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const status = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') ? 429 : 502;
-      throw new LLMConfigurationError(`Gemini connection check failed: ${msg}`, status);
-    }
-  } else {
-    const result = await runOpenAICompatibleChat({
-      baseUrl,
-      model,
-      systemPrompt: 'You are a diagnostic connectivity responder.',
-      userPrompt: 'Reply with exactly: COSMICLABS_LLM_READY',
     });
-    return {
-      ok: true,
-      provider,
-      model,
-      reply: result.text,
-      latencyMs: Date.now() - startedAt,
-    };
+  } catch (err) {
+    if (err instanceof SecurityPolicyError) {
+      throw new LLMConfigurationError(err.message, err.statusCode);
+    }
+    throw err;
   }
 }
 
@@ -370,16 +722,16 @@ export async function runBountyEnhancementWorkflow(input: {
   part3ExecutionGuidelines: string;
   fullMarkdown: string;
 }> {
-  const provider = input.providerOverride ?? ((crud.getSettingValue('provider') as LLMProviderId) || 'gemini');
-  const allowPaid = crud.getSettingValue('allowPaidRequests') === 'true';
-  const model =
-    provider === 'gemini'
-      ? input.modelOverride || crud.getSettingValue('model') || 'gemini-4-hydrogen'
-      : input.modelOverride || crud.getSettingValue('openaiCompatModel') || 'llama3.1:8b';
-  const enableGrounding =
-    input.enableGroundingOverride ?? crud.getSettingValue('enableSearchGrounding') === 'true';
+  const resolved = resolveRuntimeLLMConfig({
+    provider: input.providerOverride,
+    model: input.modelOverride,
+    enableGrounding: input.enableGroundingOverride,
+  });
+  const provider = resolved.provider;
+  const model = resolved.activeModel;
+  const enableGrounding = resolved.enableSearchGrounding;
 
-  validateModelAuthorization(provider, model, allowPaid);
+  validateModelAuthorization(provider, model, resolved.allowPaidRequests);
 
   // STAGE 1: Official Context & Verbatim Prompt Verification
   const verbatimOfficialPrompt =
@@ -482,15 +834,20 @@ export async function runBountyEnhancementWorkflow(input: {
         `Summarize key technical insights concisely with exact constraints in mind.`,
       ].join('\n');
 
-      const searchResponse = await withTransientRetry(() =>
-        ai.models.generateContent({
-          model,
-          contents: researchPrompt,
-          config: {
-            tools: [{ googleSearch: {} }],
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        })
+      const searchResponse = await withTimeout(
+        withTransientRetry(() =>
+          ai.models.generateContent({
+            model,
+            contents: researchPrompt,
+            config: {
+              tools: [{ googleSearch: {} }],
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              maxOutputTokens: 2048,
+            },
+          })
+        ),
+        20_000,
+        'Google Search grounding'
       );
 
       researchSummaryNotes = (searchResponse.text || '').trim();
@@ -554,16 +911,16 @@ export async function runBountyEnhancementWorkflow(input: {
 
   // STAGE 3: Category-Adapted Deep Analysis & Prompt Enhancement Synthesis
   const systemPrompt = [
-    `You are the Senior Principal Strategist for COSMICLABS (make.fun account ${accountHandle}), preparing a tailored, actionable enhancement strategy for Hermes (an autonomous coding agent).`,
+    `You are the Senior Principal Strategist for COSMICLABS (make.fun account ${accountHandle}), preparing a tailored, actionable enhancement strategy and master execution blueprint for AI coding agents (such as Hermes, Claude Code, Cursor, Aider, Roo Code) and human engineering teams.`,
     `CRITICAL RULES:`,
     `1. Adapt your entire reasoning and terminology to the exact competition category (${input.bounty.category}) and constraints. Never produce generic boilerplate.`,
     `2. Every recommendation must be concrete, technical/creative, and actionable. Ban meaningless phrases like "make it amazing", "build the best possible solution", or "ensure high quality" without specifying exact mechanisms, thresholds, or validation checks.`,
     `3. Never claim or imply that any strategy guarantees winning or placing.`,
     `4. Respect all official constraints (file size caps, network bans, determinism, transcript authorship rules, submission quotas).`,
     `5. Use the live Leaderboard Gap Insights to target concrete score/metric improvements over current leaders and baselines.`,
-    `6. In "part2AiEnhancement", write rich, well-structured Markdown ready to paste directly into Hermes as supplemental architectural and competitive instructions.`,
-    `7. In "part3ExecutionGuidelines", write concrete Hermes execution, verification, transcript-hygiene, and compliance rules tailored to this bounty's checks.`,
-    `8. In "recommendedSkills", curate 3 to 6 optimal engineering/domain skills, MCP integrations, or Hermes tool workflows tailored to this specific bounty (combining official skills/prerequisites with specialized optimization/verification skills). Each item must include concrete "agentDirective" telling Hermes exactly how and when to apply that skill.`,
+    `6. In "part2AiEnhancement", write rich, well-structured Markdown ready to paste directly into AI coding agents, IDE assistants, or development workflows as supplemental architectural and competitive instructions.`,
+    `7. In "part3ExecutionGuidelines", write concrete execution, verification, transcript-hygiene, and compliance rules tailored to this bounty's checks.`,
+    `8. In "recommendedSkills", curate 3 to 6 optimal engineering/domain skills, MCP integrations, or tool workflows tailored to this specific bounty (combining official skills/prerequisites with specialized optimization/verification skills). Each item must include concrete "agentDirective" instructing agents and developers exactly how and when to apply that skill.`,
     `9. Explicitly state assumptions and uncertainties where official details are missing or unverified.`,
   ].join('\n');
 
@@ -607,141 +964,172 @@ export async function runBountyEnhancementWorkflow(input: {
     .filter(Boolean)
     .join('\n');
 
-  let parsedOutput: z.infer<typeof AnalysisOutputSchema>;
-  let rawLlmText = '';
-  let tokenUsage: AIAnalysisRecord['tokenUsage'] = null;
+  const maxOutputTokens = getMaxLlmOutputTokens();
 
-  if (provider === 'gemini') {
-    const ai = createGeminiClient();
-    try {
-      const response = await withTransientRetry(() =>
-        ai.models.generateContent({
+  const { parsedOutput, rawLlmText, tokenUsage } = await withLlmExecutionGuard(async () => {
+      if (provider === 'gemini') {
+        const ai = createGeminiClient();
+        try {
+          const response = await withTimeout(
+            withTransientRetry(() =>
+              ai.models.generateContent({
+                model,
+                contents: analysisPrompt,
+                config: {
+                  systemInstruction: systemPrompt,
+                  responseMimeType: 'application/json',
+                  maxOutputTokens,
+                  thinkingConfig: {
+                    thinkingLevel:
+                      model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
+                  },
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                      objectiveSummary: { type: Type.STRING },
+                      mandatoryRequirements: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      judgingCriteria: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      recommendedApproach: { type: Type.STRING },
+                      differentiationStrategy: { type: Type.STRING },
+                      architectureOrMethodology: { type: Type.STRING },
+                      priorityMatrix: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            criterion: { type: Type.STRING },
+                            weightOrEmphasis: { type: Type.STRING },
+                            actionableFocus: { type: Type.STRING },
+                          },
+                          required: ['criterion', 'weightOrEmphasis', 'actionableFocus'],
+                        },
+                      },
+                      implementationGuidance: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      qualityStandards: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      testingValidation: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      complianceConsiderations: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      assumptionsUncertainties: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      risks: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      recommendedSkills: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            name: { type: Type.STRING },
+                            category: { type: Type.STRING },
+                            priority: {
+                              type: Type.STRING,
+                              enum: ['essential', 'recommended', 'optional'],
+                            },
+                            rationale: { type: Type.STRING },
+                            agentDirective: { type: Type.STRING },
+                          },
+                          required: ['name', 'category', 'priority', 'rationale', 'agentDirective'],
+                        },
+                      },
+                      part2AiEnhancement: { type: Type.STRING },
+                      part3ExecutionGuidelines: { type: Type.STRING },
+                    },
+                    required: [
+                      'objectiveSummary',
+                      'mandatoryRequirements',
+                      'judgingCriteria',
+                      'recommendedApproach',
+                      'differentiationStrategy',
+                      'architectureOrMethodology',
+                      'priorityMatrix',
+                      'implementationGuidance',
+                      'qualityStandards',
+                      'testingValidation',
+                      'complianceConsiderations',
+                      'assumptionsUncertainties',
+                      'risks',
+                      'recommendedSkills',
+                      'part2AiEnhancement',
+                      'part3ExecutionGuidelines',
+                    ],
+                  },
+                },
+              })
+            ),
+            SYNTHESIS_TIMEOUT_MS,
+            'Gemini enhancement synthesis'
+          );
+
+          const rawText = (response.text || '').trim();
+          if (!rawText) {
+            throw new LLMConfigurationError('Gemini returned an empty synthesis response.', 502);
+          }
+
+          let localTokenUsage: AIAnalysisRecord['tokenUsage'] = null;
+          if (response.usageMetadata) {
+            localTokenUsage = {
+              promptTokens: response.usageMetadata.promptTokenCount,
+              completionTokens: response.usageMetadata.candidatesTokenCount,
+              totalTokens: response.usageMetadata.totalTokenCount,
+            };
+          }
+
+          const jsonObj = JSON.parse(rawText);
+          const validated = AnalysisOutputSchema.parse(jsonObj);
+          return {
+            parsedOutput: validated,
+            rawLlmText: rawText,
+            tokenUsage: localTokenUsage,
+          };
+        } catch (err) {
+          if (err instanceof LLMConfigurationError) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+            throw new LLMConfigurationError(`Gemini quota exhausted (429): ${msg}`, 429);
+          }
+          if (
+            msg.includes('403') ||
+            msg.includes('PERMISSION_DENIED') ||
+            msg.includes('API_KEY_INVALID')
+          ) {
+            throw new LLMConfigurationError(
+              `Gemini authentication error: check server GEMINI_API_KEY environment variable or local .env file. (${msg})`,
+              403
+            );
+          }
+          throw new LLMConfigurationError(`LLM synthesis failed: ${msg}`, 502);
+        }
+      } else {
+        const jsonInstruction = `\n\nRespond ONLY with a valid JSON object containing keys: objectiveSummary (string), mandatoryRequirements (string[]), judgingCriteria (string[]), recommendedApproach (string), differentiationStrategy (string), architectureOrMethodology (string), priorityMatrix ({criterion, weightOrEmphasis, actionableFocus}[]), implementationGuidance (string[]), qualityStandards (string[]), testingValidation (string[]), complianceConsiderations (string[]), assumptionsUncertainties (string[]), risks (string[]), recommendedSkills ({name, category, priority: "essential"|"recommended"|"optional", rationale, agentDirective}[]), part2AiEnhancement (string), part3ExecutionGuidelines (string).`;
+        const result = await runOpenAICompatibleChat({
+          baseUrl: resolved.openaiCompatBaseUrl,
           model,
-          contents: analysisPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: 'application/json',
-            thinkingConfig: {
-              thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
-            },
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                objectiveSummary: { type: Type.STRING },
-                mandatoryRequirements: { type: Type.ARRAY, items: { type: Type.STRING } },
-                judgingCriteria: { type: Type.ARRAY, items: { type: Type.STRING } },
-                recommendedApproach: { type: Type.STRING },
-                differentiationStrategy: { type: Type.STRING },
-                architectureOrMethodology: { type: Type.STRING },
-                priorityMatrix: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      criterion: { type: Type.STRING },
-                      weightOrEmphasis: { type: Type.STRING },
-                      actionableFocus: { type: Type.STRING },
-                    },
-                    required: ['criterion', 'weightOrEmphasis', 'actionableFocus'],
-                  },
-                },
-                implementationGuidance: { type: Type.ARRAY, items: { type: Type.STRING } },
-                qualityStandards: { type: Type.ARRAY, items: { type: Type.STRING } },
-                testingValidation: { type: Type.ARRAY, items: { type: Type.STRING } },
-                complianceConsiderations: { type: Type.ARRAY, items: { type: Type.STRING } },
-                assumptionsUncertainties: { type: Type.ARRAY, items: { type: Type.STRING } },
-                risks: { type: Type.ARRAY, items: { type: Type.STRING } },
-                recommendedSkills: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      category: { type: Type.STRING },
-                      priority: { type: Type.STRING, enum: ['essential', 'recommended', 'optional'] },
-                      rationale: { type: Type.STRING },
-                      agentDirective: { type: Type.STRING },
-                    },
-                    required: ['name', 'category', 'priority', 'rationale', 'agentDirective'],
-                  },
-                },
-                part2AiEnhancement: { type: Type.STRING },
-                part3ExecutionGuidelines: { type: Type.STRING },
-              },
-              required: [
-                'objectiveSummary',
-                'mandatoryRequirements',
-                'judgingCriteria',
-                'recommendedApproach',
-                'differentiationStrategy',
-                'architectureOrMethodology',
-                'priorityMatrix',
-                'implementationGuidance',
-                'qualityStandards',
-                'testingValidation',
-                'complianceConsiderations',
-                'assumptionsUncertainties',
-                'risks',
-                'recommendedSkills',
-                'part2AiEnhancement',
-                'part3ExecutionGuidelines',
-              ],
-            },
-          },
-        })
-      );
-
-      rawLlmText = (response.text || '').trim();
-      if (!rawLlmText) {
-        throw new LLMConfigurationError('Gemini returned an empty synthesis response.', 502);
+          systemPrompt: systemPrompt + jsonInstruction,
+          userPrompt: analysisPrompt,
+          jsonMode: true,
+          attachConfiguredCredential: true,
+          timeoutMs: SYNTHESIS_TIMEOUT_MS,
+          maxTokens: maxOutputTokens,
+        });
+        const rawText = result.text;
+        const localTokenUsage = result.usage || null;
+        try {
+          const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+          const validated = AnalysisOutputSchema.parse(JSON.parse(cleaned));
+          return {
+            parsedOutput: validated,
+            rawLlmText: rawText,
+            tokenUsage: localTokenUsage,
+          };
+        } catch (err) {
+          throw new LLMConfigurationError(
+            `OpenAI-compatible endpoint returned malformed JSON schema: ${err instanceof Error ? err.message : 'Parse error'}`,
+            502
+          );
+        }
       }
-
-      if (response.usageMetadata) {
-        tokenUsage = {
-          promptTokens: response.usageMetadata.promptTokenCount,
-          completionTokens: response.usageMetadata.candidatesTokenCount,
-          totalTokens: response.usageMetadata.totalTokenCount,
-        };
-      }
-
-      const jsonObj = JSON.parse(rawLlmText);
-      parsedOutput = AnalysisOutputSchema.parse(jsonObj);
-    } catch (err) {
-      if (err instanceof LLMConfigurationError) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-        throw new LLMConfigurationError(`Gemini quota exhausted (429): ${msg}`, 429);
-      }
-      if (msg.includes('403') || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')) {
-        throw new LLMConfigurationError(
-          `Gemini authentication error: check GEMINI_API_KEY in Settings > Secrets. (${msg})`,
-          403
-        );
-      }
-      throw new LLMConfigurationError(`LLM synthesis failed: ${msg}`, 502);
+    }).catch((err) => {
+    if (err instanceof SecurityPolicyError) {
+      throw new LLMConfigurationError(err.message, err.statusCode);
     }
-  } else {
-    const baseUrl = crud.getSettingValue('openaiCompatBaseUrl');
-    const jsonInstruction = `\n\nRespond ONLY with a valid JSON object containing keys: objectiveSummary (string), mandatoryRequirements (string[]), judgingCriteria (string[]), recommendedApproach (string), differentiationStrategy (string), architectureOrMethodology (string), priorityMatrix ({criterion, weightOrEmphasis, actionableFocus}[]), implementationGuidance (string[]), qualityStandards (string[]), testingValidation (string[]), complianceConsiderations (string[]), assumptionsUncertainties (string[]), risks (string[]), recommendedSkills ({name, category, priority: "essential"|"recommended"|"optional", rationale, agentDirective}[]), part2AiEnhancement (string), part3ExecutionGuidelines (string).`;
-    const result = await runOpenAICompatibleChat({
-      baseUrl,
-      model,
-      systemPrompt: systemPrompt + jsonInstruction,
-      userPrompt: analysisPrompt,
-      jsonMode: true,
-    });
-    rawLlmText = result.text;
-    tokenUsage = result.usage || null;
-    try {
-      const cleaned = rawLlmText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-      parsedOutput = AnalysisOutputSchema.parse(JSON.parse(cleaned));
-    } catch (err) {
-      throw new LLMConfigurationError(
-        `OpenAI-compatible endpoint returned malformed JSON schema: ${err instanceof Error ? err.message : 'Parse error'}`,
-        502
-      );
-    }
-  }
+    throw err;
+  });
 
   // STAGE 4: Compliance Verification & Assembly
   const forbiddenClaimsRegex = /\b(guarantee[sd]?\s+(to\s+)?win|100%\s+win|guaranteed\s+victory)\b/gi;

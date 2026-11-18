@@ -19,6 +19,7 @@ import {
   SyncStateIndicator,
 } from '../ui/primitives';
 import { formatDateTime, formatRelativeDeadline, formatUsd } from '../../lib/utils';
+import { fetch } from '../../lib/api';
 import type {
   BountyRecord,
   BountySnapshot,

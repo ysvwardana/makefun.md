@@ -8,9 +8,23 @@ import { crud } from './server/crud.ts';
 import { AVAILABLE_MODELS, safeJsonParse } from './server/db.ts';
 import {
   LLMConfigurationError,
+  resolveRuntimeLLMConfig,
   runBountyEnhancementWorkflow,
   testLLMConnection,
+  validateModelAuthorization,
 } from './server/llm.ts';
+import {
+  createRateLimiter,
+  enforceSameOriginCsrf,
+  getAllowedOpenAICompatHosts,
+  getDailyLlmRequestCap,
+  getMaxLlmOutputTokens,
+  getOperatorAuthToken,
+  isServerPaidLlmAuthorized,
+  requireOperatorAuth,
+  SecurityPolicyError,
+  validateOpenAICompatBaseUrl,
+} from './server/security.ts';
 import { buildMasterMarkdown } from './src/lib/prompt-builder.ts';
 import {
   computeEffectiveSyncState,
@@ -19,19 +33,25 @@ import {
   syncSingleBountyDetails,
 } from './server/makefun.ts';
 import { evaluateTranscriptGates } from './server/transcript-gate.ts';
-import type { AppSettings, LLMProviderId } from './src/types/command-center.ts';
+import type { AppSettings } from './src/types/command-center.ts';
 
 const PORT = Number(process.env.PORT || 3000);
+const BIND_HOST = process.env.HOST?.trim() || (process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1');
 
 function buildSettingsResponse(): AppSettings {
-  const provider = (crud.getSettingValue('provider') as LLMProviderId) || 'gemini';
+  const resolved = resolveRuntimeLLMConfig();
   return {
-    provider,
-    model: crud.getSettingValue('model') || 'gemini-4-hydrogen',
-    openaiCompatBaseUrl: crud.getSettingValue('openaiCompatBaseUrl') || 'http://localhost:11434/v1',
-    openaiCompatModel: crud.getSettingValue('openaiCompatModel') || 'llama3.1:8b',
-    allowPaidRequests: crud.getSettingValue('allowPaidRequests') === 'true',
-    enableSearchGrounding: crud.getSettingValue('enableSearchGrounding') === 'true',
+    provider: resolved.provider,
+    model: resolved.geminiModel,
+    openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
+    openaiCompatModel: resolved.openaiCompatModel,
+    allowPaidRequests: resolved.allowPaidRequests,
+    paidPolicySource: 'server_env',
+    authRequired: Boolean(getOperatorAuthToken()),
+    allowedOpenAICompatHosts: Array.from(getAllowedOpenAICompatHosts()),
+    dailyLlmCap: getDailyLlmRequestCap(),
+    maxLlmOutputTokens: getMaxLlmOutputTokens(),
+    enableSearchGrounding: resolved.enableSearchGrounding,
     syncIntervalMinutes: Number(crud.getSettingValue('syncIntervalMinutes') || 30),
     accountHandle: crud.getSettingValue('accountHandle') || '@0xkeinara',
     permittedEvidencePaths: safeJsonParse<string[]>(
@@ -48,15 +68,31 @@ function buildSettingsResponse(): AppSettings {
   };
 }
 
+const enhancerLimiter = createRateLimiter({ bucket: 'enhancer', windowMs: 60_000, maxRequests: 12 });
+const llmTestLimiter = createRateLimiter({ bucket: 'llm-test', windowMs: 60_000, maxRequests: 15 });
+const settingsLimiter = createRateLimiter({ bucket: 'settings', windowMs: 60_000, maxRequests: 30 });
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
+
+  // CSRF / Origin & Operator Authentication for all mutating API routes
+  app.use('/api', enforceSameOriginCsrf);
+  app.use('/api', (req, res, next) => {
+    const method = req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+      next();
+      return;
+    }
+    requireOperatorAuth(req, res, next);
+  });
 
   // Health endpoint
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
       service: 'COSMICLABS Make.fun Command Center',
+      authRequired: Boolean(getOperatorAuthToken()),
       timestamp: new Date().toISOString(),
     });
   });
@@ -199,7 +235,7 @@ async function startServer() {
   });
 
   // CORE FEATURE: Genuine LLM Enhancement Workflow
-  app.post('/api/enhancer/run', async (req, res) => {
+  app.post('/api/enhancer/run', enhancerLimiter, async (req, res) => {
     const schema = z.object({
       slug: z.string().min(1),
       provider: z.enum(['gemini', 'openai_compatible']).optional(),
@@ -629,58 +665,104 @@ async function startServer() {
     res.json(buildSettingsResponse());
   });
 
-  app.patch('/api/settings', (req, res) => {
-    const schema = z.object({
-      provider: z.enum(['gemini', 'openai_compatible']).optional(),
-      model: z.string().min(1).optional(),
-      openaiCompatBaseUrl: z.string().optional(),
-      openaiCompatModel: z.string().optional(),
-      allowPaidRequests: z.boolean().optional(),
-      enableSearchGrounding: z.boolean().optional(),
-      syncIntervalMinutes: z.number().int().min(5).max(1440).optional(),
-      accountHandle: z.string().min(1).optional(),
-      permittedEvidencePaths: z.array(z.string()).optional(),
-    });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Invalid settings update.' });
+  app.patch('/api/settings', settingsLimiter, async (req, res) => {
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'allowPaidRequests')) {
+      res.status(403).json({
+        error:
+          'Paid LLM authorization is a server-side policy (ALLOW_PAID_LLM_REQUESTS environment variable) and cannot be modified via API requests.',
+      });
       return;
     }
+
+    const schema = z
+      .object({
+        provider: z.enum(['gemini', 'openai_compatible']).optional(),
+        model: z.string().trim().min(1).optional(),
+        openaiCompatBaseUrl: z.string().trim().optional(),
+        openaiCompatModel: z.string().trim().min(1).optional(),
+        geminiApiKey: z.string().optional(),
+        openaiCompatApiKey: z.string().optional(),
+        enableSearchGrounding: z.boolean().optional(),
+        syncIntervalMinutes: z.number().int().min(5).max(1440).optional(),
+        accountHandle: z.string().trim().min(1).optional(),
+        permittedEvidencePaths: z.array(z.string()).optional(),
+      })
+      .strict();
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid settings update payload.' });
+      return;
+    }
+
     const d = parsed.data;
-    if (d.provider !== undefined) crud.setSettingValue('provider', d.provider);
-    if (d.model !== undefined) crud.setSettingValue('model', d.model);
-    if (d.openaiCompatBaseUrl !== undefined) {
-      crud.setSettingValue('openaiCompatBaseUrl', d.openaiCompatBaseUrl.trim());
+    const current = resolveRuntimeLLMConfig();
+    const nextProvider = d.provider ?? current.provider;
+    const nextGeminiModel = d.model ?? current.geminiModel;
+    const nextCompatModel = d.openaiCompatModel ?? current.openaiCompatModel;
+    const nextCompatBaseUrl = d.openaiCompatBaseUrl ?? current.openaiCompatBaseUrl;
+
+    try {
+      // Validate effective provider/model authorization at save time
+      validateModelAuthorization(
+        nextProvider,
+        nextProvider === 'gemini' ? nextGeminiModel : nextCompatModel,
+        isServerPaidLlmAuthorized()
+      );
+
+      // Validate & allowlist-check OpenAI-compatible Base URL whenever provided or when provider is openai_compatible
+      let normalizedCompatUrl = nextCompatBaseUrl;
+      if (d.openaiCompatBaseUrl !== undefined || nextProvider === 'openai_compatible') {
+        normalizedCompatUrl = await validateOpenAICompatBaseUrl(nextCompatBaseUrl);
+      }
+
+      if (d.provider !== undefined) crud.setSettingValue('provider', d.provider);
+      if (d.model !== undefined) crud.setSettingValue('model', nextGeminiModel);
+      if (d.openaiCompatBaseUrl !== undefined) {
+        crud.setSettingValue('openaiCompatBaseUrl', normalizedCompatUrl);
+      }
+      if (d.openaiCompatModel !== undefined) {
+        crud.setSettingValue('openaiCompatModel', nextCompatModel);
+      }
+      if (d.geminiApiKey !== undefined) {
+        crud.setSettingValue('geminiApiKey', d.geminiApiKey.trim());
+      }
+      if (d.openaiCompatApiKey !== undefined) {
+        crud.setSettingValue('openaiCompatApiKey', d.openaiCompatApiKey.trim());
+      }
+      if (d.enableSearchGrounding !== undefined) {
+        crud.setSettingValue('enableSearchGrounding', String(d.enableSearchGrounding));
+      }
+      if (d.syncIntervalMinutes !== undefined) {
+        crud.setSettingValue('syncIntervalMinutes', String(d.syncIntervalMinutes));
+      }
+      if (d.accountHandle !== undefined) {
+        crud.setSettingValue('accountHandle', d.accountHandle);
+      }
+      if (d.permittedEvidencePaths !== undefined) {
+        crud.setSettingValue('permittedEvidencePaths', JSON.stringify(d.permittedEvidencePaths));
+      }
+      res.json(buildSettingsResponse());
+    } catch (err) {
+      if (err instanceof SecurityPolicyError || err instanceof LLMConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to validate settings.' });
     }
-    if (d.openaiCompatModel !== undefined) {
-      crud.setSettingValue('openaiCompatModel', d.openaiCompatModel.trim());
-    }
-    if (d.allowPaidRequests !== undefined) {
-      crud.setSettingValue('allowPaidRequests', String(d.allowPaidRequests));
-    }
-    if (d.enableSearchGrounding !== undefined) {
-      crud.setSettingValue('enableSearchGrounding', String(d.enableSearchGrounding));
-    }
-    if (d.syncIntervalMinutes !== undefined) {
-      crud.setSettingValue('syncIntervalMinutes', String(d.syncIntervalMinutes));
-    }
-    if (d.accountHandle !== undefined) {
-      crud.setSettingValue('accountHandle', d.accountHandle.trim());
-    }
-    if (d.permittedEvidencePaths !== undefined) {
-      crud.setSettingValue('permittedEvidencePaths', JSON.stringify(d.permittedEvidencePaths));
-    }
-    res.json(buildSettingsResponse());
   });
 
-  app.post('/api/settings/test-llm', async (req, res) => {
-    const schema = z.object({
-      provider: z.enum(['gemini', 'openai_compatible']).optional(),
-      model: z.string().optional(),
-      openaiCompatBaseUrl: z.string().optional(),
-      openaiCompatModel: z.string().optional(),
-      allowPaidRequests: z.boolean().optional(),
-    });
+  app.post('/api/settings/test-llm', llmTestLimiter, async (req, res) => {
+    const schema = z
+      .object({
+        provider: z.enum(['gemini', 'openai_compatible']).optional(),
+        model: z.string().trim().min(1).optional(),
+        openaiCompatBaseUrl: z.string().trim().optional(),
+        openaiCompatModel: z.string().trim().min(1).optional(),
+        mode: z.enum(['connectivity', 'full']).optional(),
+      })
+      .strict();
+
     const parsed = schema.safeParse(req.body || {});
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid test payload.' });
@@ -690,12 +772,19 @@ async function startServer() {
       const result = await testLLMConnection(parsed.data);
       res.json(result);
     } catch (err) {
-      if (err instanceof LLMConfigurationError) {
+      if (err instanceof LLMConfigurationError || err instanceof SecurityPolicyError) {
         res.status(err.statusCode).json({ ok: false, error: err.message });
         return;
       }
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : 'Test failed' });
     }
+  });
+
+  // Global API error handler returning JSON (preventing HTML fallback for API routes)
+  app.use('/api', (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || 'Internal server error';
+    res.status(status).json({ error: message });
   });
 
   // Vite or Static Frontend Mounting
@@ -713,8 +802,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`COSMICLABS Make.fun Command Center listening on http://localhost:${PORT}`);
+  app.listen(PORT, BIND_HOST, () => {
+    console.log(`COSMICLABS Make.fun Command Center listening on http://${BIND_HOST}:${PORT}`);
   });
 }
 

@@ -107,20 +107,35 @@ Database tersimpan lokal di `./data/cosmiclabs.db` dan otomatis diinisialisasi s
 
 ## Konfigurasi Environment
 
-Salin `.env.example` atau atur environment variable pada runtime/Secrets:
+Untuk penggunaan lokal, salin `.env.example` menjadi `.env` (jangan commit `.env` berisi secret asli). Pada lingkungan hosting/Cloud, atur variabel yang sama melalui environment variables atau secret manager platform:
 
 ```env
-# Wajib jika menggunakan provider Google Gemini (dikelola di server-side)
+# Wajib jika menggunakan provider Google Gemini (hanya dibaca di server-side)
 GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 
-# Opsional jika menggunakan endpoint OpenAI-compatible lokal/eksternal yang memerlukan Bearer token
+# Opsional jika menggunakan endpoint OpenAI-compatible yang membutuhkan Bearer token
+# (hanya dikirim ke URL tersimpan yang lolos SSRF & host allowlist)
 OPENAI_COMPAT_API_KEY=""
 
-# Opsional (default: 3000)
-PORT=3000
+# Opsional: daftar host tambahan (dipisah koma) untuk OpenAI-compatible Base URL selain loopback
+ALLOWED_OPENAI_COMPAT_HOSTS=""
+
+# Kebijakan server-side untuk model Gemini berbayar (default: false; tidak dapat diubah dari UI/klien)
+ALLOW_PAID_LLM_REQUESTS="false"
+
+# Opsional: token autentikasi operator untuk endpoint mutasi API (Bearer / X-Operator-Token)
+COMMAND_CENTER_TOKEN=""
+
+# Opsional: batas harian & output token LLM
+MAX_DAILY_LLM_CALLS="50"
+MAX_LLM_OUTPUT_TOKENS="8192"
+
+# Network binding (default lokal: 127.0.0.1; 0.0.0.0 hanya untuk Cloud Run / reverse proxy tepercaya)
+HOST="127.0.0.1"
+PORT="3000"
 ```
 
-> **Catatan Keamanan & Biaya**: API key hanya dibaca di sisi server (`server/llm.ts`). Model Gemini berbayar (`gemini-4-argon`, `gemini-4-carbon`) diblokir secara default hingga Founder mengaktifkan otorisasi eksplisit di halaman **Settings**. Model free-tier default adalah `gemini-4-hydrogen` dan `gemini-3.1-flash-lite`.
+> **Catatan Keamanan & Biaya**: API key hanya dibaca di server (`server/llm.ts`) dan statusnya ditampilkan secara read-only di halaman **Settings**. Model Gemini berbayar (`gemini-4-argon`, `gemini-4-carbon`) diblokir di server kecuali `ALLOW_PAID_LLM_REQUESTS=true`. Untuk provider OpenAI-compatible, biaya bergantung pada target endpoint (Ollama lokal $0; gateway eksternal dapat mengenakan biaya).
 
 ---
 

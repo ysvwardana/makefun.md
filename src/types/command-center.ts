@@ -266,9 +266,30 @@ export interface ModelOption {
   id: string;
   label: string;
   provider: LLMProviderId;
-  tier: 'free' | 'paid';
+  tier: 'free' | 'paid' | 'depends_on_endpoint';
   description: string;
   supportsGrounding: boolean;
+}
+
+export interface LLMConnectionTestReport {
+  ok: boolean;
+  provider: LLMProviderId;
+  model: string;
+  reply: string;
+  latencyMs: number;
+  connectivity: {
+    ok: boolean;
+    latencyMs: number;
+    detail: string;
+  };
+  capability: {
+    ok: boolean;
+    jsonModeSupported: boolean;
+    structuredSchemaSupported: boolean;
+    thinkingSupported: boolean;
+    groundingConfigured: boolean;
+    detail: string;
+  };
 }
 
 export interface AppSettings {
@@ -277,6 +298,11 @@ export interface AppSettings {
   openaiCompatBaseUrl: string;
   openaiCompatModel: string;
   allowPaidRequests: boolean;
+  paidPolicySource: 'server_env';
+  authRequired: boolean;
+  allowedOpenAICompatHosts: string[];
+  dailyLlmCap: number;
+  maxLlmOutputTokens: number;
   enableSearchGrounding: boolean;
   syncIntervalMinutes: number;
   accountHandle: string;

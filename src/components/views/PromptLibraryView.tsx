@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Copy, Check, Download, ExternalLink, History, Sparkles } from 'lucide-react';
 import { Button, EmptyState, Panel, PanelHeader } from '../ui/primitives';
 import { downloadMarkdownFile, formatDateTime } from '../../lib/utils';
+import { fetch } from '../../lib/api';
 import type { PromptDraftRecord, PromptVersionRecord } from '../../types/command-center';
 
 interface PromptLibraryViewProps {

@@ -19,6 +19,7 @@ import {
   Select,
 } from '../ui/primitives';
 import { formatDateTime, formatUsd } from '../../lib/utils';
+import { fetch } from '../../lib/api';
 import type { BountyRecord, ClaimStatus, RewardRecord } from '../../types/command-center';
 
 export const RewardsAnalyticsView: React.FC = () => {

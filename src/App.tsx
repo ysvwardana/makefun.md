@@ -22,6 +22,7 @@ import { SubmissionsView } from './components/views/SubmissionsView';
 import { RewardsAnalyticsView } from './components/views/RewardsAnalyticsView';
 import { SettingsView } from './components/views/SettingsView';
 import { Button } from './components/ui/primitives';
+import { fetch } from './lib/api';
 import type { AppSettings } from './types/command-center';
 
 type NavId =

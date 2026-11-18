@@ -9,6 +9,7 @@ import {
   Select,
 } from '../ui/primitives';
 import { formatDateTime } from '../../lib/utils';
+import { fetch } from '../../lib/api';
 import type { BountyRecord, SubmissionRecord, SubmissionStatus } from '../../types/command-center';
 
 const STATUS_META: Record<

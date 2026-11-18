@@ -29,6 +29,7 @@ import {
   mergeRecommendedSkills,
 } from '../../lib/prompt-builder';
 import { computeLineDiff, downloadMarkdownFile, formatDateTime, formatUsd } from '../../lib/utils';
+import { fetch } from '../../lib/api';
 import type {
   AIAnalysisRecord,
   AppSettings,
@@ -497,7 +498,13 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                     key={m.id}
                     value={m.provider === 'openai_compatible' ? 'openai_compatible' : m.id}
                   >
-                    {m.label} ({m.tier === 'free' ? 'Free Tier' : 'Paid Tier'})
+                    {m.label} (
+                    {m.tier === 'free'
+                      ? 'Free Tier'
+                      : m.tier === 'depends_on_endpoint'
+                        ? 'Cost Depends on Endpoint'
+                        : 'Paid — Server Policy'}
+                    )
                   </option>
                 ))}
               </Select>
@@ -1010,7 +1017,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                         <Input
                           value={customSkillDirective}
                           onChange={(e) => setCustomSkillDirective(e.target.value)}
-                          placeholder="Concrete Hermes directive (how & when to apply this skill)..."
+                          placeholder="Concrete execution directive (how & when to apply this skill)..."
                           className="h-8 text-xs flex-1"
                           required
                         />
@@ -1089,7 +1096,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
 
                 <div>
                   <label className="block text-xs font-medium text-[#D1D5DB] mb-1.5">
-                    Part 3 — Hermes Execution & Compliance Guidelines (Editable)
+                    Part 3 — Execution & Compliance Guidelines (Editable)
                   </label>
                   <Textarea
                     rows={5}
@@ -1109,7 +1116,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                       rows={3}
                       value={founderInstructions}
                       onChange={(e) => setFounderInstructions(e.target.value)}
-                      placeholder="Optional constraints, language preferences, or local tooling notes for Hermes..."
+                      placeholder="Optional constraints, language preferences, or local tooling notes for agents/developers..."
                       className="text-xs"
                     />
                   </div>
@@ -1139,7 +1146,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
             <Panel>
               <PanelHeader
                 title="4. Final Master Prompt Preview"
-                subtitle="Ready to copy into Hermes (read-only command center — never executes prompts)"
+                subtitle="Ready to copy into AI coding agents, IDE assistants, or developer workflows (read-only command center — never executes prompts)"
                 actions={
                   <div className="flex items-center gap-2">
                     <Button variant="secondary" size="sm" onClick={handleCopyPrompt}>
