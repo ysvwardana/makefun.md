@@ -126,32 +126,34 @@ PORT=3000
 
 ## Menjalankan Secara Lokal
 
+> **Package Manager:** Proyek ini menggunakan **Bun** (`bun.lock`). Jangan gunakan `npm install` karena dapat gagal dengan konflik peer dependency (`ERESOLVE vite` vs `esbuild`).
+
 ### 1. Instalasi Dependensi
 ```bash
-npm install
+bun install
 ```
 
 ### 2. Menjalankan Development Server (Port 3000)
 ```bash
-npm run dev
+bun run dev
 ```
 Aplikasi tersedia di `http://localhost:3000`.
 
 ### 3. Typecheck, Build Produksi, dan Unit Test
 ```bash
 # TypeScript check
-npm run lint
+bun run lint
 
 # Build frontend produksi (Vite)
-npm run build
+bun run build
 
 # Jalankan unit test (skill builder, transcript gate, dan Drizzle CRUD)
-npx tsx --test tests/command-center.test.ts tests/crud.test.ts
+bunx tsx --test tests/command-center.test.ts tests/crud.test.ts
 ```
 
 ### 4. Menjalankan Mode Produksi
 ```bash
-NODE_ENV=production npm start
+NODE_ENV=production bun run start
 ```
 
 ---
