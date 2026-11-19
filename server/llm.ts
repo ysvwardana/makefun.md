@@ -527,7 +527,7 @@ export async function testLLMConnection(overrides?: {
         if (testMode === 'connectivity') {
           return {
             ok: true,
-            provider: 'openai_compatible',
+            provider: effective.provider,
             model: effective.openaiCompatModel,
             reply: connResult.text,
             latencyMs: connLatency,
@@ -576,7 +576,7 @@ export async function testLLMConnection(overrides?: {
 
         return {
           ok: jsonOk,
-          provider: 'openai_compatible',
+          provider: effective.provider,
           model: effective.openaiCompatModel,
           reply: connResult.text,
           latencyMs: Date.now() - startedAt,

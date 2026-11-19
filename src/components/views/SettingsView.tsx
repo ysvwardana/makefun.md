@@ -20,6 +20,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
   const [openaiCompatModel, setOpenaiCompatModel] = useState('llama3.1:8b');
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [openaiCompatApiKey, setOpenaiCompatApiKey] = useState('');
+
   const [enableSearchGrounding, setEnableSearchGrounding] = useState(true);
   const [syncIntervalMinutes, setSyncIntervalMinutes] = useState(30);
   const [accountHandle, setAccountHandle] = useState('@0xkeinara');
@@ -106,14 +107,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
     setTesting(true);
     setTestResult(null);
     try {
+      const isCompat = provider === 'openai_compatible';
       const res = await fetch('/api/settings/test-llm', {
         method: 'POST',
         headers: buildRequestHeaders(),
         body: JSON.stringify({
           provider,
           model,
-          openaiCompatBaseUrl: provider === 'openai_compatible' ? openaiCompatBaseUrl : undefined,
-          openaiCompatModel: provider === 'openai_compatible' ? openaiCompatModel : undefined,
+          openaiCompatBaseUrl: isCompat ? openaiCompatBaseUrl : undefined,
+          openaiCompatModel: isCompat ? openaiCompatModel : undefined,
           mode,
         }),
       });
@@ -182,7 +184,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
             {/* Read-only server credential & security policy status */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
               <div className="rounded-md bg-[#090B0E] border border-white/[0.07] p-3 flex items-center justify-between gap-2">
-                <span className="text-[#9CA3AF]">Server GEMINI_API_KEY (Env)</span>
+                <span className="text-[#9CA3AF]">Server GEMINI_API_KEY</span>
                 {settings?.credentialStatus.geminiKeyConfigured ? (
                   <span className="inline-flex items-center gap-1.5 text-[#10B981] font-mono">
                     <CheckCircle2 className="w-3.5 h-3.5" />
@@ -196,7 +198,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
                 )}
               </div>
               <div className="rounded-md bg-[#090B0E] border border-white/[0.07] p-3 flex items-center justify-between gap-2">
-                <span className="text-[#9CA3AF]">Server OPENAI_COMPAT_API_KEY</span>
+                <span className="text-[#9CA3AF]">Server OPENAI_COMPAT_KEY</span>
                 {settings?.credentialStatus.openaiCompatKeyConfigured ? (
                   <span className="inline-flex items-center gap-1.5 text-[#10B981] font-mono">
                     <CheckCircle2 className="w-3.5 h-3.5" />
@@ -223,7 +225,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
               </div>
               <div>
                 <label className="block text-xs font-medium text-[#D1D5DB] mb-1.5">
-                  Update OpenAI-Compatible API Key
+                  Update OpenAI-Compatible Key
                 </label>
                 <Input
                   type="password"
@@ -319,7 +321,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSettings
                   className="w-full"
                 >
                   <option value="gemini">Google Gemini (Server SDK)</option>
-                  <option value="openai_compatible">OpenAI-Compatible (Cost Depends on Endpoint)</option>
+                  <option value="openai_compatible">OpenAI-Compatible (Local Ollama / vLLM)</option>
                 </Select>
               </div>
 

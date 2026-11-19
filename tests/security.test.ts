@@ -93,6 +93,7 @@ test('Server-side paid authorization policy cannot be bypassed and enforces mode
     process.env.ALLOW_PAID_LLM_REQUESTS = 'true';
     assert.equal(isServerPaidLlmAuthorized(), true);
     assert.doesNotThrow(() => validateModelAuthorization('gemini', 'gemini-4-argon', true));
+    assert.doesNotThrow(() => validateModelAuthorization('openai_compatible', 'local-model', false));
   } finally {
     if (prevPaid === undefined) {
       delete process.env.ALLOW_PAID_LLM_REQUESTS;

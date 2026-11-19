@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -61,8 +62,8 @@ function buildSettingsResponse(): AppSettings {
     lastGlobalSyncAt: crud.getSettingValue('lastGlobalSyncAt') || null,
     nextCursor: crud.getSettingValue('nextCursor') || null,
     credentialStatus: {
-      geminiKeyConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
-      openaiCompatKeyConfigured: Boolean(process.env.OPENAI_COMPAT_API_KEY?.trim()),
+      geminiKeyConfigured: Boolean(process.env.GEMINI_API_KEY?.trim() || crud.getSettingValue('geminiApiKey')?.trim()),
+      openaiCompatKeyConfigured: Boolean(process.env.OPENAI_COMPAT_API_KEY?.trim() || crud.getSettingValue('openaiCompatApiKey')?.trim()),
     },
     availableModels: AVAILABLE_MODELS,
   };
