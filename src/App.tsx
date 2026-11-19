@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Award,
@@ -60,6 +60,8 @@ export default function App() {
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [syncStatus, setSyncStatus] = useState<{ running: boolean; lastSuccessAt: string | null; lastError: string | null } | null>(null);
+  const lastSyncRef = useRef<string | null>(null);
 
   const fetchOverviewAndSettings = async () => {
     try {
@@ -85,13 +87,45 @@ export default function App() {
 
   useEffect(() => {
     fetchOverviewAndSettings();
+    let disposed = false;
+    const controller = new AbortController();
+    const readSyncStatus = async () => {
+      try {
+        const res = await fetch('/api/bounties/sync-status', { signal: controller.signal });
+        if (!res.ok) return;
+        const status = await res.json();
+        if (disposed) return;
+        setSyncStatus(status);
+        setSyncing(status.running);
+        if (status.lastSuccessAt && status.lastSuccessAt !== lastSyncRef.current) {
+          lastSyncRef.current = status.lastSuccessAt;
+          window.dispatchEvent(new Event('makefun:bounties-updated'));
+          await fetchOverviewAndSettings();
+        }
+      } catch { /* Retry on the next status poll. */ }
+    };
+    void readSyncStatus();
+    const timer = window.setInterval(readSyncStatus, 15000);
+    window.addEventListener('focus', readSyncStatus);
+    return () => {
+      disposed = true;
+      controller.abort();
+      window.clearInterval(timer);
+      window.removeEventListener('focus', readSyncStatus);
+    };
   }, []);
 
   const handleGlobalSync = async () => {
     setSyncing(true);
     try {
-      await fetch('/api/bounties/sync', { method: 'POST' });
-      await fetchOverviewAndSettings();
+      const response = await fetch('/api/bounties/sync', { method: 'POST' });
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        setOverviewError(result.error || 'Bounty sync failed.');
+      } else {
+        window.dispatchEvent(new Event('makefun:bounties-updated'));
+        await fetchOverviewAndSettings();
+      }
     } finally {
       setSyncing(false);
     }
@@ -243,6 +277,10 @@ export default function App() {
         </header>
 
         <main className="flex-1 p-5 lg:p-6 max-w-[1440px] w-full mx-auto">
+          <div role="status" className="mb-4 text-xs text-[#9CA3AF]">
+            {syncStatus?.running ? 'Sinkronisasi bounty berjalan…' : `Sync terakhir berhasil: ${syncStatus?.lastSuccessAt ? new Date(syncStatus.lastSuccessAt).toLocaleString() : 'belum tersedia'}`}
+            {syncStatus?.lastError && <span className="ml-3 text-[#FCA5A5]">Refresh gagal: {syncStatus.lastError}</span>}
+          </div>
           {activeTab === 'overview' && (
             <OverviewView
               data={overviewData}

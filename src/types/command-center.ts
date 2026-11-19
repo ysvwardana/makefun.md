@@ -1,6 +1,9 @@
+import type { AnalysisEvidence, PromptSource } from './enhancement.ts';
+export type { AnalysisEvidence, PromptSource, GateCoverage, GlobalSyncStatus } from './enhancement.ts';
+
 export type SyncState = 'LIVE' | 'STALE' | 'OFFLINE' | 'UNVERIFIED';
 
-export type LLMProviderId = 'gemini' | 'openai_compatible';
+export type LLMProviderId = 'openai_compatible';
 
 export type SubmissionStatus = 'submitted' | 'accepted' | 'judged' | 'awarded' | 'rejected';
 
@@ -133,6 +136,10 @@ export interface BountySnapshot {
   manualPromptOverride: string | null;
   fetchedAt: string;
   contentHash: string;
+  promptSource?: PromptSource | null;
+  refreshIssues?: string[];
+  requirementsComplete?: boolean;
+  rulesHash?: string;
 }
 
 export interface ResearchReference {
@@ -176,6 +183,9 @@ export interface AIAnalysisRecord {
   researchReferences: ResearchReference[];
   researchDisclosures: string;
   recommendedSkills?: RecommendedSkill[];
+  evidence?: AnalysisEvidence | null;
+  part2AiEnhancement?: string | null;
+  part3ExecutionGuidelines?: string | null;
   tokenUsage: {
     promptTokens?: number;
     completionTokens?: number;
@@ -190,6 +200,9 @@ export interface PromptVersionRecord {
   bountySlug: string;
   versionNumber: number;
   analysisId: string | null;
+  sourceSnapshotId?: number | null;
+  sourceRulesHash?: string | null;
+  provenanceStatus?: 'verified' | 'legacy_unverified';
   part1OriginalPrompt: string;
   part2AiEnhancement: string;
   part3ExecutionGuidelines: string;
@@ -276,15 +289,12 @@ export interface AppSettings {
   model: string;
   openaiCompatBaseUrl: string;
   openaiCompatModel: string;
-  allowPaidRequests: boolean;
-  enableSearchGrounding: boolean;
   syncIntervalMinutes: number;
   accountHandle: string;
   permittedEvidencePaths: string[];
   lastGlobalSyncAt: string | null;
   nextCursor: string | null;
   credentialStatus: {
-    geminiKeyConfigured: boolean;
     openaiCompatKeyConfigured: boolean;
   };
   availableModels: ModelOption[];

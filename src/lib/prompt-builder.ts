@@ -115,7 +115,8 @@ export function formatSkillsDirectiveSection(skills?: RecommendedSkill[]): strin
   const lines = [
     '### Agent Skill & Tooling Directives',
     '',
-    'Activate and follow the curated skill stack below when planning, implementing, and verifying this bounty:',
+    'Before using a skill below, resolve its exact installed Hermes skill name with `skills_list()` and load it with `skill_view(name)`. If a matching skill is unavailable, report it and continue with the applicable directive. Do not install skills automatically.',
+    'For entries labeled Official MCP, verify that the named MCP integration and its required tools are available before using them.',
     '',
   ];
 
@@ -152,12 +153,13 @@ export function buildMasterMarkdown(params: {
     `# COSMICLABS Master Prompt — ${params.bountyTitle} (${params.bountySlug})`,
     `Official Bounty URL: ${params.bountyUrl}`,
     `Notice: Official make.fun competition rules always take precedence over enhancement suggestions.`,
+    'Hermes may prepare and verify the entry. Hand the final artifacts and submission instructions to the user for manual submission.',
     '',
     '---',
     '',
     '## PART 1 — ORIGINAL MAKE.FUN PROMPT',
     '',
-    params.part1OriginalPrompt.trim() || '(Official prompt not loaded)',
+    params.part1OriginalPrompt,
     '',
     '---',
     '',

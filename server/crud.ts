@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { count, desc, eq, max, or, sql } from 'drizzle-orm';
+import { buildMasterMarkdown } from '../src/lib/prompt-builder.ts';
+import { computeSnapshotHashes } from './snapshot-hash.ts';
 import {
   type CommandCenterDatabase,
   mapAnalysisRecord,
@@ -10,6 +12,7 @@ import {
   mapRewardRecord,
   mapSnapshotRecord,
   mapSubmissionRecord,
+  safeJsonParse,
   orm as defaultOrm,
 } from './db.ts';
 import {
@@ -25,6 +28,7 @@ import {
 } from './schema.ts';
 import type {
   AIAnalysisRecord,
+  AnalysisEvidence,
   AppSettings,
   BountyRecord,
   BountySnapshot,
@@ -34,6 +38,7 @@ import type {
   PrerequisitesData,
   PriorityItem,
   PromptDraftRecord,
+  PromptSource,
   PromptVersionRecord,
   RecommendedSkill,
   ResearchReference,
@@ -87,6 +92,10 @@ export interface SaveSnapshotInput {
   manualPromptOverride?: string | null;
   fetchedAt: string;
   contentHash: string;
+  promptSource?: PromptSource | null;
+  refreshIssues?: string[];
+  requirementsComplete?: boolean;
+  rulesHash?: string;
 }
 
 export interface CreateAIAnalysisInput {
@@ -113,6 +122,7 @@ export interface CreateAIAnalysisInput {
   recommendedSkills?: RecommendedSkill[];
   rawLlmResponse: string;
   tokenUsage: AIAnalysisRecord['tokenUsage'];
+  evidence?: AnalysisEvidence | null;
   createdAt?: string;
 }
 
@@ -120,7 +130,7 @@ export interface CreatePromptVersionInput {
   bountySlug: string;
   bountyTitle: string;
   analysisId?: string | null;
-  part1OriginalPrompt: string;
+  part1OriginalPrompt?: string;
   part2AiEnhancement: string;
   part3ExecutionGuidelines: string;
   founderInstructions?: string;
@@ -129,6 +139,11 @@ export interface CreatePromptVersionInput {
   editSummary?: string;
   founderNotes?: string;
   createdBy?: string;
+  sourceSnapshotId?: number | null;
+  allowStaleRules?: boolean;
+  expectedCurrentRulesHash?: string | null;
+  expectedCurrentSnapshotId?: number;
+  expectedCurrentSnapshotHash?: string;
 }
 
 export interface UpsertSubmissionInput {
@@ -368,13 +383,18 @@ export function createCommandCenterCrud(ormDb: CommandCenterDatabase) {
   // Bounty Snapshots CRUD
   // =========================================================================
   function getLatestBountySnapshot(slug: string): BountySnapshot | null {
-    const row = ormDb
-      .select()
-      .from(bountySnapshots)
-      .where(eq(bountySnapshots.bountySlug, slug))
-      .orderBy(desc(bountySnapshots.id))
-      .limit(1)
-      .get();
+    const row = ormDb.select().from(bountySnapshots).where(eq(bountySnapshots.bountySlug, slug)).orderBy(desc(bountySnapshots.id)).limit(1).get();
+    return row ? mapSnapshotRecord(row) : null;
+  }
+
+  function getBountySnapshotById(id: number): BountySnapshot | null {
+    const row = ormDb.select().from(bountySnapshots).where(eq(bountySnapshots.id, id)).get();
+    return row ? mapSnapshotRecord(row) : null;
+  }
+
+  function getLatestCompleteBountySnapshot(slug: string): BountySnapshot | null {
+    const row = ormDb.select().from(bountySnapshots).where(eq(bountySnapshots.bountySlug, slug)).orderBy(desc(bountySnapshots.id)).all()
+      .find((candidate) => Boolean(candidate.requirementsComplete) && Boolean(candidate.promptSourceJson));
     return row ? mapSnapshotRecord(row) : null;
   }
 
@@ -389,83 +409,78 @@ export function createCommandCenterCrud(ormDb: CommandCenterDatabase) {
   }
 
   function saveBountySnapshot(input: SaveSnapshotInput): BountySnapshot {
-    const previous = ormDb
-      .select()
-      .from(bountySnapshots)
-      .where(eq(bountySnapshots.bountySlug, input.bountySlug))
-      .orderBy(desc(bountySnapshots.id))
-      .limit(1)
-      .get();
+    const previous = ormDb.select().from(bountySnapshots).where(eq(bountySnapshots.bountySlug, input.bountySlug)).orderBy(desc(bountySnapshots.id)).limit(1).get();
+    // Only explicitly-proven manual sources may carry forward. A legacy manual field is not provenance.
+    const previousSource = previous ? safePromptSource(previous.promptSourceJson) : null;
+    const promptSource = input.promptSource ?? (previousSource?.kind === 'manual' ? previousSource : null);
+    const manualOverride = promptSource?.kind === 'manual'
+      ? (input.manualPromptOverride !== undefined ? input.manualPromptOverride : previous?.manualPromptOverride ?? null)
+      : null;
+    const effectivePrompt = promptSource?.kind === 'manual' ? manualOverride ?? '' : input.officialPromptText;
+    const computedHashes = computeSnapshotHashes({
+      competition: input.rawCompetition,
+      requirements: input.rawRequirements,
+      leaderboard: input.rawLeaderboard,
+      kit: input.rawKit,
+      prompt: effectivePrompt,
+      promptSource,
+    });
+    const row = ormDb.insert(bountySnapshots).values({
+      bountySlug: input.bountySlug,
+      sourceEndpoint: input.sourceEndpoint,
+      rawCompetitionJson: input.rawCompetition ? JSON.stringify(input.rawCompetition) : null,
+      rawRequirementsJson: input.rawRequirements ? JSON.stringify(input.rawRequirements) : null,
+      rawLeaderboardJson: input.rawLeaderboard ? JSON.stringify(input.rawLeaderboard) : null,
+      rawKitJson: input.rawKit ? JSON.stringify(input.rawKit) : null,
+      officialPromptText: input.officialPromptText,
+      manualPromptOverride: manualOverride,
+      promptSourceJson: promptSource ? JSON.stringify(promptSource) : null,
+      refreshIssuesJson: JSON.stringify(input.refreshIssues ?? []),
+      requirementsComplete: input.requirementsComplete ?? false,
+      rulesHash: input.rulesHash ?? '',
+      fetchedAt: input.fetchedAt,
+      contentHash: input.contentHash || computedHashes.contentHash,
+    }).returning().get();
+    return mapSnapshotRecord(row);
+  }
 
-    const manualOverride =
-      input.manualPromptOverride !== undefined
-        ? input.manualPromptOverride
-        : previous?.manualPromptOverride ?? null;
-
-    if (!previous || previous.contentHash !== input.contentHash || !previous.rawRequirementsJson) {
-      const inserted = ormDb
-        .insert(bountySnapshots)
-        .values({
-          bountySlug: input.bountySlug,
-          sourceEndpoint: input.sourceEndpoint,
-          rawCompetitionJson: input.rawCompetition ? JSON.stringify(input.rawCompetition) : null,
-          rawRequirementsJson: input.rawRequirements ? JSON.stringify(input.rawRequirements) : null,
-          rawLeaderboardJson: input.rawLeaderboard ? JSON.stringify(input.rawLeaderboard) : null,
-          rawKitJson: input.rawKit ? JSON.stringify(input.rawKit) : null,
-          officialPromptText: input.officialPromptText,
-          manualPromptOverride: manualOverride,
-          fetchedAt: input.fetchedAt,
-          contentHash: input.contentHash,
-        })
-        .returning()
-        .get();
-      return mapSnapshotRecord(inserted);
-    }
-
-    ormDb
-      .update(bountySnapshots)
-      .set({ fetchedAt: input.fetchedAt })
-      .where(eq(bountySnapshots.id, previous.id))
-      .run();
-
-    return getLatestBountySnapshot(input.bountySlug)!;
+  function safePromptSource(raw: string | null): PromptSource | null {
+    const source = safeJsonParse<PromptSource | null>(raw, null);
+    if (!source || !['official_api', 'manual'].includes(source.kind) || typeof source.locator !== 'string' ||
+        typeof source.capturedAt !== 'string' || typeof source.bountySlug !== 'string') return null;
+    return source;
   }
 
   function upsertManualPromptOverride(slug: string, manualPromptText: string): BountySnapshot {
-    const trimmed = manualPromptText.trim();
-    const latest = ormDb
-      .select()
-      .from(bountySnapshots)
-      .where(eq(bountySnapshots.bountySlug, slug))
-      .orderBy(desc(bountySnapshots.id))
-      .limit(1)
-      .get();
-
-    if (latest) {
-      ormDb
-        .update(bountySnapshots)
-        .set({ manualPromptOverride: trimmed })
-        .where(eq(bountySnapshots.id, latest.id))
-        .run();
-    } else {
-      ormDb
-        .insert(bountySnapshots)
-        .values({
-          bountySlug: slug,
-          sourceEndpoint: 'manual_verified_paste',
-          rawCompetitionJson: null,
-          rawRequirementsJson: null,
-          rawLeaderboardJson: null,
-          rawKitJson: null,
-          officialPromptText: '',
-          manualPromptOverride: trimmed,
-          fetchedAt: new Date().toISOString(),
-          contentHash: crypto.createHash('sha256').update(trimmed).digest('hex').slice(0, 16),
-        })
-        .run();
-    }
-
-    return getLatestBountySnapshot(slug)!;
+    if (!manualPromptText.trim()) throw Object.assign(new Error('Manual prompt must not be blank.'), { statusCode: 400 });
+    const latest = getLatestBountySnapshot(slug);
+    const now = new Date().toISOString();
+    const promptSource: PromptSource = { kind: 'manual', locator: 'manual:user-paste', capturedAt: now, bountySlug: slug };
+    const manualHashes = computeSnapshotHashes({
+      competition: latest?.rawCompetition ?? {},
+      requirements: latest?.rawRequirements ?? null,
+      leaderboard: latest?.rawLeaderboard ?? null,
+      kit: latest?.rawKit ?? null,
+      prompt: manualPromptText,
+      promptSource,
+    });
+    const inserted = ormDb.insert(bountySnapshots).values({
+      bountySlug: slug,
+      sourceEndpoint: latest?.sourceEndpoint ?? 'manual_verified_paste',
+      rawCompetitionJson: latest?.rawCompetition ? JSON.stringify(latest.rawCompetition) : null,
+      rawRequirementsJson: latest?.rawRequirements ? JSON.stringify(latest.rawRequirements) : null,
+      rawLeaderboardJson: latest?.rawLeaderboard ? JSON.stringify(latest.rawLeaderboard) : null,
+      rawKitJson: latest?.rawKit ? JSON.stringify(latest.rawKit) : null,
+      officialPromptText: latest?.officialPromptText ?? '',
+      manualPromptOverride: manualPromptText,
+      promptSourceJson: JSON.stringify(promptSource),
+      refreshIssuesJson: JSON.stringify(latest?.refreshIssues ?? []),
+      requirementsComplete: latest?.requirementsComplete ?? false,
+      rulesHash: latest?.requirementsComplete ? manualHashes.rulesHash : '',
+      fetchedAt: latest?.fetchedAt ?? now,
+      contentHash: manualHashes.contentHash,
+    }).returning().get();
+    return mapSnapshotRecord(inserted);
   }
 
   // =========================================================================
@@ -501,6 +516,7 @@ export function createCommandCenterCrud(ormDb: CommandCenterDatabase) {
         recommendedSkillsJson: input.recommendedSkills
           ? JSON.stringify(input.recommendedSkills)
           : null,
+        evidenceJson: input.evidence ? JSON.stringify(input.evidence) : null,
         rawLlmResponse: input.rawLlmResponse,
         tokenUsageJson: input.tokenUsage ? JSON.stringify(input.tokenUsage) : null,
         createdAt,
@@ -604,79 +620,104 @@ export function createCommandCenterCrud(ormDb: CommandCenterDatabase) {
     version: PromptVersionRecord;
   } {
     return ormDb.transaction((tx) => {
-      const nowIso = new Date().toISOString();
-      let draftRow = tx
-        .select()
-        .from(promptDrafts)
-        .where(eq(promptDrafts.bountySlug, input.bountySlug))
-        .get();
+      const fail = (message: string, statusCode: 400 | 409 = 400): never => {
+        throw Object.assign(new Error(message), { statusCode });
+      };
+      const bountyRow = tx.select().from(bounties).where(eq(bounties.slug, input.bountySlug)).get();
+      if (!bountyRow) return fail('Bounty does not exist.');
 
+      const sourceRow = input.sourceSnapshotId == null
+        ? tx.select().from(bountySnapshots).where(eq(bountySnapshots.bountySlug, input.bountySlug)).orderBy(desc(bountySnapshots.id)).all()
+            .find((candidate) => Boolean(candidate.promptSourceJson) && Boolean(candidate.requirementsComplete))
+        : tx.select().from(bountySnapshots).where(eq(bountySnapshots.id, input.sourceSnapshotId)).get();
+      if (!sourceRow || sourceRow.bountySlug !== input.bountySlug) return fail('A valid source snapshot for this bounty is required.', 409);
+      const source = mapSnapshotRecord(sourceRow);
+      const promptSource = source.promptSource;
+      const effectivePrompt = promptSource?.kind === 'manual' ? source.manualPromptOverride : source.officialPromptText;
+      if (!promptSource || !['official_api', 'manual'].includes(promptSource.kind) ||
+          promptSource.bountySlug !== input.bountySlug || typeof promptSource.locator !== 'string' || !promptSource.locator.trim() ||
+          typeof promptSource.capturedAt !== 'string' || !promptSource.capturedAt.trim() ||
+          typeof effectivePrompt !== 'string' || !effectivePrompt.trim() || source.requirementsComplete !== true || !source.rulesHash?.trim()) {
+        return fail('Source snapshot is incomplete or has no proven prompt provenance.', 409);
+      }
+      if (input.part1OriginalPrompt !== undefined && input.part1OriginalPrompt !== effectivePrompt) {
+        return fail('Client standard prompt does not exactly match the selected source snapshot.', 409);
+      }
+
+      const latest = tx.select().from(bountySnapshots).where(eq(bountySnapshots.bountySlug, input.bountySlug)).orderBy(desc(bountySnapshots.id)).limit(1).get();
+      const currentRulesHash = latest?.requirementsComplete && latest.rulesHash ? latest.rulesHash : null;
+      if (input.allowStaleRules) {
+        if (input.expectedCurrentRulesHash === undefined) {
+          return fail('The rules hash shown for stale confirmation is required.', 409);
+        }
+        if (input.expectedCurrentRulesHash === null) {
+          if (!latest || !input.expectedCurrentSnapshotId || !input.expectedCurrentSnapshotHash ||
+              latest.id !== input.expectedCurrentSnapshotId || latest.contentHash !== input.expectedCurrentSnapshotHash) {
+            return fail('The current incomplete snapshot changed after confirmation. Review it and try again.', 409);
+          }
+        } else if (input.expectedCurrentRulesHash !== currentRulesHash || !latest ||
+            (input.expectedCurrentSnapshotId !== undefined && latest.id !== input.expectedCurrentSnapshotId) ||
+            (input.expectedCurrentSnapshotHash !== undefined && latest.contentHash !== input.expectedCurrentSnapshotHash)) {
+          return fail('The bounty rules changed after confirmation. Review the current snapshot and try again.', 409);
+        }
+      } else if (latest && (latest.rulesHash || '') !== (source.rulesHash || '')) {
+        return fail('Source snapshot rules are stale; refresh or explicitly allow stale rules.', 409);
+      }
+
+      if (input.analysisId) {
+        const analysisRow = tx.select().from(aiAnalyses).where(eq(aiAnalyses.id, input.analysisId)).get();
+        if (!analysisRow || analysisRow.bountySlug !== input.bountySlug) return fail('Analysis does not exist for this bounty.', 409);
+        const evidence = safeJsonParse<AnalysisEvidence | null>(analysisRow.evidenceJson, null);
+        if (!evidence || evidence.snapshotId !== source.id || evidence.snapshotHash !== source.contentHash ||
+            evidence.rulesHash !== source.rulesHash || typeof evidence.contextHash !== 'string' || !evidence.contextHash.trim() ||
+            typeof evidence.contextFetchedAt !== 'string' || !evidence.contextFetchedAt.trim() ||
+            !evidence.promptSource || evidence.promptSource.kind !== promptSource.kind ||
+            evidence.promptSource.locator !== promptSource.locator || evidence.promptSource.bountySlug !== promptSource.bountySlug ||
+            evidence.promptSource.capturedAt !== promptSource.capturedAt) {
+          return fail('Analysis evidence does not match the selected snapshot, prompt source, context, and rules.', 409);
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      let draftRow = tx.select().from(promptDrafts).where(eq(promptDrafts.bountySlug, input.bountySlug)).get();
       let draftId: string;
       if (!draftRow) {
         draftId = crypto.randomUUID();
-        draftRow = tx
-          .insert(promptDrafts)
-          .values({
-            id: draftId,
-            bountySlug: input.bountySlug,
-            title: input.bountyTitle,
-            latestVersionId: null,
-            founderNotes: input.founderNotes || '',
-            createdAt: nowIso,
-            updatedAt: nowIso,
-          })
-          .returning()
-          .get();
-      } else {
-        draftId = draftRow.id;
-      }
+        draftRow = tx.insert(promptDrafts).values({
+          id: draftId, bountySlug: input.bountySlug, title: input.bountyTitle, latestVersionId: null,
+          founderNotes: input.founderNotes || '', createdAt: nowIso, updatedAt: nowIso,
+        }).returning().get();
+      } else draftId = draftRow.id;
 
-      const maxRow = tx
-        .select({ maxVer: max(promptVersions.versionNumber) })
-        .from(promptVersions)
-        .where(eq(promptVersions.draftId, draftId))
-        .get();
+      const maxRow = tx.select({ maxVer: max(promptVersions.versionNumber) }).from(promptVersions)
+        .where(eq(promptVersions.draftId, draftId)).get();
       const nextVersionNumber = Number(maxRow?.maxVer || 0) + 1;
       const versionId = crypto.randomUUID();
-
-      const savedVersion = tx
-        .insert(promptVersions)
-        .values({
-          id: versionId,
-          draftId,
-          bountySlug: input.bountySlug,
-          versionNumber: nextVersionNumber,
-          analysisId: input.analysisId ?? null,
-          part1OriginalPrompt: input.part1OriginalPrompt,
-          part2AiEnhancement: input.part2AiEnhancement,
-          part3ExecutionGuidelines: input.part3ExecutionGuidelines,
-          founderInstructions: input.founderInstructions || '',
-          selectedSkillsJson: input.selectedSkills
-            ? JSON.stringify(input.selectedSkills)
-            : null,
-          fullMarkdown: input.fullMarkdown,
-          editSummary: input.editSummary || `Version ${nextVersionNumber}`,
-          createdBy: input.createdBy || 'Founder',
-          createdAt: nowIso,
-        })
-        .returning()
-        .get();
-
-      const savedDraft = tx
-        .update(promptDrafts)
-        .set({
-          latestVersionId: versionId,
-          founderNotes: input.founderNotes ?? draftRow.founderNotes,
-          updatedAt: nowIso,
-        })
-        .where(eq(promptDrafts.id, draftId))
-        .returning()
-        .get();
-
-      return {
-        draft: mapPromptDraftRecord(savedDraft),
-        version: mapPromptVersionRecord(savedVersion),
-      };
+      const part1 = effectivePrompt;
+      const selectedSkills = input.selectedSkills ?? [];
+      const fullMarkdown = buildMasterMarkdown({
+        bountyTitle: bountyRow.title,
+        bountySlug: bountyRow.slug,
+        bountyUrl: bountyRow.url,
+        part1OriginalPrompt: part1,
+        part2AiEnhancement: input.part2AiEnhancement,
+        part3ExecutionGuidelines: input.part3ExecutionGuidelines,
+        founderInstructions: input.founderInstructions || '',
+        selectedSkills,
+      });
+      const savedVersion = tx.insert(promptVersions).values({
+        id: versionId, draftId, bountySlug: input.bountySlug, versionNumber: nextVersionNumber,
+        analysisId: input.analysisId ?? null, sourceSnapshotId: source.id, sourceRulesHash: source.rulesHash,
+        provenanceStatus: 'verified', part1OriginalPrompt: part1,
+        part2AiEnhancement: input.part2AiEnhancement, part3ExecutionGuidelines: input.part3ExecutionGuidelines,
+        founderInstructions: input.founderInstructions || '', selectedSkillsJson: input.selectedSkills ? JSON.stringify(input.selectedSkills) : null,
+        fullMarkdown, editSummary: input.editSummary || `Version ${nextVersionNumber}`,
+        createdBy: input.createdBy || 'Founder', createdAt: nowIso,
+      }).returning().get();
+      const savedDraft = tx.update(promptDrafts).set({
+        latestVersionId: versionId, founderNotes: input.founderNotes ?? draftRow.founderNotes, updatedAt: nowIso,
+      }).where(eq(promptDrafts.id, draftId)).returning().get();
+      return { draft: mapPromptDraftRecord(savedDraft), version: mapPromptVersionRecord(savedVersion) };
     });
   }
 
@@ -1099,6 +1140,8 @@ export function createCommandCenterCrud(ormDb: CommandCenterDatabase) {
     deleteBounty,
     // Snapshots
     getLatestBountySnapshot,
+    getBountySnapshotById,
+    getLatestCompleteBountySnapshot,
     hasAnyBountySnapshot,
     saveBountySnapshot,
     upsertManualPromptOverride,

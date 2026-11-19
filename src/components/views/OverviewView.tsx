@@ -97,7 +97,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             COSMICLABS Command Overview
           </h1>
           <p className="text-xs text-[#9CA3AF] mt-1">
-            Account {data.settings.accountHandle} · Active LLM: {data.settings.provider === 'gemini' ? data.settings.model : data.settings.openaiCompatModel} · Last Sync: {data.lastGlobalSyncAt ? formatDateTime(data.lastGlobalSyncAt) : 'Not synced yet'}
+            Account {data.settings.accountHandle} · Active LLM: {data.settings.openaiCompatModel} · Last Sync: {data.lastGlobalSyncAt ? formatDateTime(data.lastGlobalSyncAt) : 'Not synced yet'}
           </p>
         </div>
         <div className="flex items-center gap-2.5">

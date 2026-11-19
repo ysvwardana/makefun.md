@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   Copy,
@@ -28,6 +28,9 @@ import {
   extractOfficialBountySkills,
   mergeRecommendedSkills,
 } from '../../lib/prompt-builder';
+import { createStudioRequestGuard } from '../../lib/studio-request';
+import { readEnhancementStream, type EnhancementLogEntry } from '../../lib/enhancement-stream';
+import { BountyResearchPanel } from './BountyResearchPanel';
 import { computeLineDiff, downloadMarkdownFile, formatDateTime, formatUsd } from '../../lib/utils';
 import type {
   AIAnalysisRecord,
@@ -35,7 +38,6 @@ import type {
   BountyRecord,
   BountySnapshot,
   LeaderboardGapInsights,
-  LLMProviderId,
   PromptDraftRecord,
   PromptVersionRecord,
   RecommendedSkill,
@@ -74,6 +76,82 @@ function formatSourceTypeLabel(sourceType: ResearchReference['sourceType']): str
   }
 }
 
+interface CachedSnapshot {
+  id: number;
+  fetchedAt: string;
+  contentHash: string;
+  rulesHash: string;
+}
+
+interface StudioApiError {
+  error?: string;
+  refreshIssues?: string[];
+  cacheAvailable?: boolean;
+  cachedSnapshot?: CachedSnapshot;
+  refreshError?: string | null;
+}
+
+interface BountyContext extends StudioApiError {
+  bounty: BountyRecord;
+  snapshot: BountySnapshot | null;
+  analysisSourceSnapshot?: BountySnapshot | null;
+  leaderboardInsights?: LeaderboardGapInsights | null;
+  analyses?: AIAnalysisRecord[];
+  draft?: PromptDraftRecord | null;
+  versions?: PromptVersionRecord[];
+}
+
+interface EditorSource {
+  part1: string;
+  snapshotId: number | null;
+  rulesHash: string | null;
+  analysisId: string | null;
+  legacy: boolean;
+}
+
+function readStandardPrompt(snapshot: BountySnapshot | null, slug: string): string {
+  const source = snapshot?.promptSource;
+  if (!snapshot || snapshot.bountySlug !== slug || source?.bountySlug !== slug ||
+      !source.locator?.trim() || !source.capturedAt?.trim()) return '';
+  const standard = source.kind === 'manual' ? snapshot.manualPromptOverride :
+    source.kind === 'official_api' ? snapshot.officialPromptText : null;
+  return typeof standard === 'string' && standard.trim() && snapshot.contentHash.trim() ? standard : '';
+}
+
+function snapshotIdentity(snapshot: BountySnapshot | null | undefined): CachedSnapshot | null {
+  if (!snapshot) return null;
+  return { id: snapshot.id, fetchedAt: snapshot.fetchedAt, contentHash: snapshot.contentHash, rulesHash: snapshot.rulesHash ?? '' };
+}
+
+function versionSource(version: PromptVersionRecord): EditorSource {
+  const legacy = version.provenanceStatus !== 'verified' ||
+    !version.sourceSnapshotId || !version.sourceRulesHash;
+  return {
+    part1: version.part1OriginalPrompt,
+    snapshotId: legacy ? null : version.sourceSnapshotId ?? null,
+    rulesHash: legacy ? null : version.sourceRulesHash ?? null,
+    analysisId: legacy ? null : version.analysisId,
+    legacy,
+  };
+}
+
+function mergeIssues(...issues: (string[] | undefined)[]): string[] {
+  return [...new Set(issues.flatMap((list) => list ?? []))];
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+async function readStudioJson<T>(response: Response): Promise<T> {
+  try {
+    return await response.json() as T;
+  } catch (error) {
+    if (response.ok) throw error;
+    throw new Error(`Request failed (HTTP ${response.status}).`);
+  }
+}
+
 interface PromptStudioViewProps {
   initialSlug: string | null;
   settings: AppSettings | null;
@@ -86,23 +164,33 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
   onDataMutated,
 }) => {
   const [bounties, setBounties] = useState<BountyRecord[]>([]);
-  const [selectedSlug, setSelectedSlug] = useState<string>(initialSlug || '');
-  const [loadingBounty, setLoadingBounty] = useState(false);
+  const [requestGuard] = useState(() => createStudioRequestGuard(initialSlug || ''));
+  const [selection, setSelection] = useState(() => ({ slug: initialSlug || '' }));
+  const selectedSlug = selection.slug;
+  const [loadingBounty, setLoadingBounty] = useState(Boolean(initialSlug));
+  const [listError, setListError] = useState<string | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
+  const [refreshIssues, setRefreshIssues] = useState<string[]>([]);
+  const [cacheOffer, setCacheOffer] = useState<(CachedSnapshot & { founderInstructions: string }) | null>(null);
+  const [staleAcknowledgment, setStaleAcknowledgment] = useState<string | null>(null);
 
   const [bounty, setBounty] = useState<BountyRecord | null>(null);
   const [snapshot, setSnapshot] = useState<BountySnapshot | null>(null);
   const [leaderboardInsights, setLeaderboardInsights] = useState<LeaderboardGapInsights | null>(null);
+  const [researchSnapshot, setResearchSnapshot] = useState<BountySnapshot | null>(null);
+  const [researchRefreshError, setResearchRefreshError] = useState<string | null>(null);
   const [analyses, setAnalyses] = useState<AIAnalysisRecord[]>([]);
   const [activeAnalysis, setActiveAnalysis] = useState<AIAnalysisRecord | null>(null);
+  const [enhancementLog, setEnhancementLog] = useState<EnhancementLogEntry[]>([]);
+  const enhancementLogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const log = enhancementLogRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [enhancementLog]);
   const [draft, setDraft] = useState<PromptDraftRecord | null>(null);
   const [versions, setVersions] = useState<PromptVersionRecord[]>([]);
 
-  // LLM Configuration controls for this Studio run
-  const [provider, setProvider] = useState<LLMProviderId>(settings?.provider || 'gemini');
-  const [model, setModel] = useState<string>(settings?.model || 'gemini-4-hydrogen');
-  const [enableGrounding, setEnableGrounding] = useState<boolean>(
-    settings?.enableSearchGrounding ?? true
-  );
+  const model = settings?.openaiCompatModel || 'llama3.1:8b';
 
   // Manual Official Prompt Fallback Drawer
   const [showManualPromptBox, setShowManualPromptBox] = useState(false);
@@ -110,7 +198,8 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
   const [savingManualPrompt, setSavingManualPrompt] = useState(false);
 
   // Editor state
-  const [part1Original, setPart1Original] = useState('');
+  const [editorSource, setEditorSource] = useState<EditorSource | null>(null);
+  const [currentRules, setCurrentRules] = useState<CachedSnapshot | null>(null);
   const [part2Enhancement, setPart2Enhancement] = useState('');
   const [part3Guidelines, setPart3Guidelines] = useState('');
   const [founderInstructions, setFounderInstructions] = useState('');
@@ -127,9 +216,11 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
 
   // Run & Save feedback
   const [enhancing, setEnhancing] = useState(false);
-  const [enhanceStageLabel, setEnhanceStageLabel] = useState('');
+  const [uncoveredGateError, setUncoveredGateError] = useState<Array<{ gateId: string; reason?: string }>>([]);
   const [enhanceError, setEnhanceError] = useState<string | null>(null);
   const [savingVersion, setSavingVersion] = useState(false);
+  const [checkingReuseRules, setCheckingReuseRules] = useState(false);
+  const [reuseRulesFailure, setReuseRulesFailure] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -138,183 +229,341 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
   const [diffBaseId, setDiffBaseId] = useState<string>('');
   const [diffTargetId, setDiffTargetId] = useState<string>('');
 
-  useEffect(() => {
-    if (settings) {
-      setProvider(settings.provider);
-      setModel(settings.provider === 'gemini' ? settings.model : settings.openaiCompatModel);
-      setEnableGrounding(settings.enableSearchGrounding);
-    }
-  }, [settings]);
-
-  useEffect(() => {
-    if (initialSlug) {
-      setSelectedSlug(initialSlug);
-    }
-  }, [initialSlug]);
-
-  useEffect(() => {
-    fetch('/api/bounties?status=all')
-      .then((r) => r.json())
-      .then((d) => {
-        const list = (d.items || []) as BountyRecord[];
-        setBounties(list);
-        if (!selectedSlug && list.length > 0) {
-          const openFirst = list.find((b) => b.status === 'open') || list[0];
-          setSelectedSlug(openFirst.slug);
-        }
-      })
-      .catch(() => {});
-  }, []);
-
-  const loadBountyContext = async (slug: string, refresh = false) => {
-    if (!slug) return;
-    setLoadingBounty(true);
+  const changeSelection = useCallback((slug: string) => {
+    if (!requestGuard.select(slug)) return;
+    setSelection({ slug });
+    setLoadingBounty(Boolean(slug));
+    setBounty(null);
+    setSnapshot(null);
+    setCurrentRules(null);
+    setLeaderboardInsights(null);
+    setResearchSnapshot(null);
+    setResearchRefreshError(null);
+    setAnalyses([]);
+    setActiveAnalysis(null);
+    setEnhancementLog([]);
+    setDraft(null);
+    setVersions([]);
+    setEditorSource(null);
+    setPart2Enhancement('');
+    setPart3Guidelines('');
+    setFounderInstructions('');
+    setFounderNotes('');
+    setEditSummary('');
+    setSelectedSkills([]);
+    setShowAddSkill(false);
+    setCustomSkillName('');
+    setCustomSkillCategory('Hermes Skill');
+    setCustomSkillPriority('essential');
+    setCustomSkillDirective('');
+    setShowManualPromptBox(false);
+    setManualPromptDraft('');
+    setSavingManualPrompt(false);
+    setSavingVersion(false);
+    setCheckingReuseRules(false);
+    setReuseRulesFailure(null);
+    setEnhancing(false);
+    setCopied(false);
+    setContextError(null);
     setEnhanceError(null);
     setSaveNotice(null);
-    try {
-      const res = await fetch(`/api/bounties/${encodeURIComponent(slug)}${refresh ? '?refresh=1' : ''}`);
-      if (!res.ok) return;
-      const data = await res.json();
-      setBounty(data.bounty);
-      setSnapshot(data.snapshot);
-      setLeaderboardInsights(data.leaderboardInsights || null);
-      const latestAnalysis = ((data.analyses && data.analyses[0]) || null) as AIAnalysisRecord | null;
-      setAnalyses(data.analyses || []);
-      setActiveAnalysis(latestAnalysis);
-      setDraft(data.draft || null);
-      const vers = (data.versions || []) as PromptVersionRecord[];
-      setVersions(vers);
+    setRefreshIssues([]);
+    setUncoveredGateError([]);
+    setCacheOffer(null);
+    setStaleAcknowledgment(null);
+    setPreviewTab('preview');
+    setDiffBaseId('');
+    setDiffTargetId('');
+  }, [requestGuard]);
 
-      const verbatim =
-        data.snapshot?.manualPromptOverride ||
-        data.snapshot?.officialPromptText ||
-        `${data.bounty.title}\n\n${data.bounty.summary || ''}`.trim();
+  useLayoutEffect(() => {
+    if (initialSlug) changeSelection(initialSlug);
+  }, [initialSlug, changeSelection]);
 
-      setPart1Original(verbatim);
-      setManualPromptDraft(data.snapshot?.manualPromptOverride || data.snapshot?.officialPromptText || '');
-      setFounderNotes(data.draft?.founderNotes || data.bounty.founderNotes || '');
-
-      const officialSkills = extractOfficialBountySkills(data.bounty as BountyRecord);
-
-      if (vers.length > 0) {
-        const latest = vers[0];
-        setPart2Enhancement(latest.part2AiEnhancement);
-        setPart3Guidelines(latest.part3ExecutionGuidelines);
-        setFounderInstructions(latest.founderInstructions);
-        setSelectedSkills(
-          latest.selectedSkills && latest.selectedSkills.length > 0
-            ? latest.selectedSkills
-            : mergeRecommendedSkills({
-                officialSkills,
-                aiSkills: latestAnalysis?.recommendedSkills || [],
-              })
-        );
-        setDiffTargetId(latest.id);
-        setDiffBaseId(vers[1]?.id || latest.id);
-      } else {
-        setPart2Enhancement('');
-        setPart3Guidelines('');
-        setFounderInstructions('');
-        setSelectedSkills(
-          mergeRecommendedSkills({
-            officialSkills,
-            aiSkills: latestAnalysis?.recommendedSkills || [],
-          })
-        );
-        setDiffTargetId('');
-        setDiffBaseId('');
-      }
-    } finally {
-      setLoadingBounty(false);
-    }
-  };
+  useLayoutEffect(() => () => requestGuard.invalidate(), [requestGuard]);
 
   useEffect(() => {
-    if (selectedSlug) {
-      loadBountyContext(selectedSlug);
+    // List refreshes are independent of the selected bounty's request scope.
+    const listGuard = createStudioRequestGuard();
+    const refreshList = async () => {
+      const request = listGuard.begin('list')!;
+      try {
+        const res = await fetch('/api/bounties?status=all', { signal: request.signal });
+        const data = await readStudioJson<StudioApiError & { items?: BountyRecord[] }>(res);
+        if (!request.isCurrent()) return;
+        if (!res.ok) throw new Error(data.error || 'Failed to load bounties.');
+        const list = data.items ?? [];
+        setBounties(list);
+        setListError(null);
+        if (!requestGuard.slug && list.length > 0) {
+          changeSelection((list.find((b) => b.status === 'open') ?? list[0]).slug);
+        }
+      } catch (err) {
+        if (request.isCurrent()) setListError(errorMessage(err, 'Failed to load bounties.'));
+      } finally {
+        request.finish();
+      }
+    };
+    void refreshList();
+    window.addEventListener('makefun:bounties-updated', refreshList);
+    window.addEventListener('focus', refreshList);
+    return () => {
+      listGuard.invalidate();
+      window.removeEventListener('makefun:bounties-updated', refreshList);
+      window.removeEventListener('focus', refreshList);
+    };
+  }, [changeSelection, requestGuard]);
+
+  const loadBountyContext = useCallback(async (slug: string, refresh = false, preserveEditor = false) => {
+    if (!slug) return;
+    const request = requestGuard.begin('context', slug);
+    if (!request) return;
+    setLoadingBounty(true);
+    setContextError(null);
+    setEnhanceError(null);
+    setUncoveredGateError([]);
+    setSaveNotice(null);
+    setCacheOffer(null);
+    setStaleAcknowledgment(null);
+    try {
+      const res = await fetch(`/api/bounties/${encodeURIComponent(slug)}${refresh ? '?refresh=1' : ''}`, {
+        signal: request.signal,
+      });
+      const data = await readStudioJson<BountyContext>(res);
+      if (!request.isCurrent()) return;
+      if (!res.ok) throw new Error(data.error || 'Failed to load bounty context.');
+      if (data.bounty?.slug !== slug || (data.snapshot && data.snapshot.bountySlug !== slug)) {
+        throw new Error('The returned bounty context did not match the selected bounty.');
+      }
+      setBounty(data.bounty);
+      setSnapshot(data.snapshot ?? null);
+      setCurrentRules(snapshotIdentity(data.snapshot));
+      setRefreshIssues(mergeIssues(data.snapshot?.refreshIssues, data.refreshIssues, data.refreshError ? [data.refreshError] : []));
+      setLeaderboardInsights(data.leaderboardInsights ?? null);
+      setResearchSnapshot(data.snapshot ?? null);
+      setResearchRefreshError(data.refreshError ?? null);
+      const historyAnalyses = (data.analyses ?? []).filter((item) => item.bountySlug === slug);
+      setAnalyses(historyAnalyses);
+      const history = (data.versions ?? []).filter((item) => item.bountySlug === slug);
+      setVersions(history);
+      const currentDraft = data.draft?.bountySlug === slug ? data.draft : null;
+      setDraft(currentDraft);
+
+      if (preserveEditor) return;
+      const latest = history.find((item) => item.id === currentDraft?.latestVersionId) ?? history[0];
+      const versionEvidence = latest ? versionSource(latest) : null;
+      const latestAnalysis = historyAnalyses.find((item) => item.id === latest?.analysisId) ??
+        (versionEvidence?.legacy ? null : historyAnalyses[0] ?? null);
+      setActiveAnalysis(latestAnalysis);
+      const standard = readStandardPrompt(data.snapshot ?? null, slug);
+      setManualPromptDraft(data.snapshot?.promptSource?.kind === 'manual' ? standard : '');
+      setFounderNotes(data.draft?.founderNotes ?? data.bounty.founderNotes ?? '');
+      const analysisSnapshot = data.analysisSourceSnapshot ?? null;
+      const analysisStandard = readStandardPrompt(analysisSnapshot, slug);
+      const evidence = latestAnalysis?.evidence;
+      const source = analysisSnapshot?.promptSource;
+      const recoverAnalysis = !latest && latestAnalysis && analysisSnapshot && evidence && analysisStandard &&
+        latestAnalysis.part2AiEnhancement?.trim() && latestAnalysis.part3ExecutionGuidelines?.trim() &&
+        evidence.snapshotId === analysisSnapshot.id && evidence.snapshotHash === analysisSnapshot.contentHash &&
+        evidence.rulesHash === analysisSnapshot.rulesHash && analysisSnapshot.requirementsComplete === true &&
+        evidence.promptSource?.bountySlug === slug && evidence.promptSource.kind === source?.kind &&
+        evidence.promptSource.locator === source?.locator && evidence.promptSource.capturedAt === source?.capturedAt;
+      setEditorSource(latest ? versionSource(latest) : recoverAnalysis ? {
+        part1: analysisStandard,
+        snapshotId: analysisSnapshot.id,
+        rulesHash: evidence.rulesHash,
+        analysisId: latestAnalysis.id,
+        legacy: false,
+      } : null);
+      setPart2Enhancement(latest?.part2AiEnhancement ?? (recoverAnalysis ? latestAnalysis.part2AiEnhancement! : ''));
+      setPart3Guidelines(latest?.part3ExecutionGuidelines ?? (recoverAnalysis ? latestAnalysis.part3ExecutionGuidelines! : ''));
+      setFounderInstructions(latest?.founderInstructions ?? '');
+      setSelectedSkills(latest?.selectedSkills?.length ? latest.selectedSkills : mergeRecommendedSkills({
+        officialSkills: extractOfficialBountySkills(data.bounty),
+        aiSkills: latestAnalysis?.recommendedSkills ?? [],
+      }));
+      setDiffTargetId(latest?.id ?? '');
+      setDiffBaseId(history.find((item) => item.id !== latest?.id)?.id ?? latest?.id ?? '');
+    } catch (err) {
+      if (request.isCurrent()) {
+        const message = errorMessage(err, 'Failed to load bounty context.');
+        setContextError(message);
+        setResearchRefreshError(message);
+      }
+    } finally {
+      if (request.finish()) setLoadingBounty(false);
     }
-  }, [selectedSlug]);
+  }, [requestGuard]);
+
+  useEffect(() => {
+    if (selection.slug) void loadBountyContext(selection.slug);
+  }, [selection, loadBountyContext]);
+
+  const contextMatches = Boolean(bounty && bounty.slug === selectedSlug);
+  const working = loadingBounty || enhancing || savingVersion || savingManualPrompt || checkingReuseRules;
+  const canStart = () => contextMatches && requestGuard.slug === selectedSlug && !working &&
+    !['context', 'enhance', 'save', 'manual', 'reuse'].some(requestGuard.isPending);
+  const standardPrompt = readStandardPrompt(snapshot, selectedSlug);
+  const sourceSnapshotId = editorSource ? editorSource.snapshotId : snapshot?.id;
+  const sourceRulesHash = editorSource ? editorSource.rulesHash : snapshot?.rulesHash;
+  const part1Original = editorSource ? editorSource.part1 : standardPrompt;
+  const analysisEvidence = activeAnalysis?.evidence;
+  const coverage = analysisEvidence?.gateCoverage ?? [];
+  // A source decision applies only to the precise current and editor snapshots on screen.
+  const currentRulesUnknown = !currentRules;
+  const staleKey = sourceRulesHash && ((currentRules && sourceRulesHash !== currentRules.rulesHash) || currentRulesUnknown)
+    ? JSON.stringify([selectedSlug, sourceSnapshotId, sourceRulesHash, currentRules?.rulesHash ?? 'unknown']) : null;
+  const allowStaleRules = staleKey !== null && staleAcknowledgment === staleKey;
+  const sourceMatches = !snapshot || sourceSnapshotId !== snapshot.id || part1Original === standardPrompt;
+  const canEnhance = contextMatches && !working && (!editorSource?.legacy || Boolean(standardPrompt));
+  const canRunEnhancement = canEnhance && Boolean(standardPrompt);
+  const canUseEditor = contextMatches && !working && !contextError && !editorSource?.legacy && sourceMatches &&
+    Boolean(part1Original.trim() && part2Enhancement.trim() && part3Guidelines.trim() && sourceSnapshotId && sourceRulesHash) &&
+    (!staleKey || allowStaleRules);
 
   const handleSaveManualPrompt = async () => {
-    if (!selectedSlug || manualPromptDraft.trim().length < 10) return;
+    if (!canStart() || !manualPromptDraft.trim()) return;
+    const request = requestGuard.begin('manual', selectedSlug);
+    if (!request) return;
     setSavingManualPrompt(true);
+    setEnhanceError(null);
+    setUncoveredGateError([]);
+    setSaveNotice(null);
     try {
       const res = await fetch(`/api/bounties/${encodeURIComponent(selectedSlug)}/manual-prompt`, {
         method: 'POST',
+        signal: request.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ manualPromptText: manualPromptDraft }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setSnapshot(data.snapshot);
-        setPart1Original(data.snapshot.manualPromptOverride || data.snapshot.officialPromptText);
-        setShowManualPromptBox(false);
-        setSaveNotice('Saved manually verified official prompt text.');
+      const data = await readStudioJson<StudioApiError & { snapshot: BountySnapshot }>(res);
+      if (!request.isCurrent()) return;
+      if (!res.ok) throw new Error(data.error || 'Failed to save manual prompt.');
+      const standard = readStandardPrompt(data.snapshot, selectedSlug);
+      if (data.snapshot?.promptSource?.kind !== 'manual' || standard !== manualPromptDraft) {
+        throw new Error('The server did not return the exact manual prompt as the current source.');
       }
+      setSnapshot(data.snapshot);
+      setCurrentRules(snapshotIdentity(data.snapshot));
+      setRefreshIssues(data.snapshot.refreshIssues ?? []);
+      setContextError(null);
+      setManualPromptDraft(standard);
+      setShowManualPromptBox(false);
+      setEditorSource(null);
+      setActiveAnalysis(null);
+      setAnalyses([]);
+      setPart2Enhancement('');
+      setPart3Guidelines('');
+      setSelectedSkills((previous) => mergeRecommendedSkills({
+        officialSkills: bounty ? extractOfficialBountySkills(bounty) : [],
+        customSkills: previous.filter((skill) => skill.source === 'founder_custom'),
+      }));
+      setStaleAcknowledgment(null);
+      setCacheOffer(null);
+      setSaveNotice('Saved the pasted prompt as the current manual source. Review or regenerate Parts 2 and 3 against this source before saving.');
+    } catch (err) {
+      if (request.isCurrent()) setEnhanceError(errorMessage(err, 'Failed to save manual prompt.'));
     } finally {
-      setSavingManualPrompt(false);
+      if (request.finish()) setSavingManualPrompt(false);
     }
   };
 
-  const handleEnhanceWithAI = async () => {
-    if (!selectedSlug) return;
+  const handleEnhanceWithAI = async (cached?: NonNullable<typeof cacheOffer>) => {
+    if (!canStart() || !canEnhance || (!cached && !standardPrompt)) return;
+    const request = requestGuard.begin('enhance', selectedSlug);
+    if (!request) return;
+    const instructions = cached?.founderInstructions ?? founderInstructions;
+    setEnhancementLog([{ timestamp: new Date().toISOString(), message: 'Menghubungi server Command Center.' }]);
     setEnhancing(true);
     setEnhanceError(null);
+    setUncoveredGateError([]);
     setSaveNotice(null);
-    setEnhanceStageLabel('Stage 1/4: Verifying official bounty context...');
-
-    const stageTimers = [
-      setTimeout(() => setEnhanceStageLabel('Stage 2/4: Running read-only technical research...'), 1500),
-      setTimeout(() => setEnhanceStageLabel('Stage 3/4: Synthesizing category-tailored enhancement...'), 4200),
-      setTimeout(() => setEnhanceStageLabel('Stage 4/4: Verifying compliance & assembling prompt...'), 7500),
-    ];
-
+    setCacheOffer(null);
     try {
       const res = await fetch('/api/enhancer/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        signal: request.signal,
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
         body: JSON.stringify({
           slug: selectedSlug,
-          provider,
-          model,
-          enableGrounding,
-          founderInstructions,
+          founderInstructions: instructions,
+          ...(cached ? { useCachedSnapshotId: cached.id } : {}),
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setEnhanceError(data.error || 'LLM enhancement failed.');
-        return;
+      type EnhancementResponse = StudioApiError & {
+        analysis: AIAnalysisRecord;
+        snapshot: BountySnapshot;
+        currentSnapshot?: CachedSnapshot | null;
+        part1OriginalPrompt: string;
+        part2AiEnhancement: string;
+        part3ExecutionGuidelines: string;
+        recommendedSkills?: RecommendedSkill[];
+        details?: { uncoveredGates?: Array<{ gateId: string; reason?: string }>; refreshIssues?: string[]; snapshot?: BountySnapshot; totalChars?: number; maxContextChars?: number; sectionLengths?: Record<string, number> };
+      };
+      const { data, status } = res.headers.get('content-type')?.includes('application/x-ndjson')
+        ? await readEnhancementStream<EnhancementResponse>(res, (entry) => {
+          if (request.isCurrent()) setEnhancementLog((previous) => [...previous, entry]);
+        })
+        : { status: res.status, data: await readStudioJson<EnhancementResponse>(res) };
+      if (!request.isCurrent()) return;
+      if (status < 200 || status >= 300) {
+        if (data.details?.snapshot?.bountySlug === selectedSlug && !data.cachedSnapshot) {
+          setSnapshot(data.details.snapshot);
+          setCurrentRules(snapshotIdentity(data.details.snapshot));
+          setStaleAcknowledgment(null);
+        }
+        setRefreshIssues((previous) => mergeIssues(previous, data.refreshIssues, data.details?.refreshIssues));
+        setUncoveredGateError(data.details?.uncoveredGates ?? []);
+        if (status === 409 && data.cacheAvailable === true && data.cachedSnapshot?.id) {
+          setCacheOffer({ ...data.cachedSnapshot, founderInstructions: instructions });
+        }
+        const sizeReport = data.details?.sectionLengths
+          ? ` Context: ${data.details.totalChars} / ${data.details.maxContextChars} characters. Sections not sent: ${Object.entries(data.details.sectionLengths).map(([name, length]) => `${name} (${length})`).join(', ')}.`
+          : '';
+        throw new Error((data.error || 'LLM enhancement failed.') + sizeReport);
       }
 
+      const evidence = data.analysis?.evidence;
+      const standard = readStandardPrompt(data.snapshot, selectedSlug);
+      const source = data.snapshot?.promptSource;
+      if (!standard || data.part1OriginalPrompt !== standard || data.analysis?.bountySlug !== selectedSlug ||
+          !evidence || evidence.snapshotId !== data.snapshot.id || evidence.snapshotHash !== data.snapshot.contentHash ||
+          !evidence.rulesHash || evidence.rulesHash !== data.snapshot.rulesHash ||
+          evidence.usedCache !== Boolean(cached) || (cached && evidence.snapshotId !== cached.id) ||
+          evidence.promptSource?.kind !== source?.kind || evidence.promptSource?.bountySlug !== selectedSlug ||
+          evidence.promptSource.locator !== source?.locator || evidence.promptSource.capturedAt !== source?.capturedAt) {
+        throw new Error('The returned enhancement did not match its recorded prompt snapshot. Refresh Official and try again.');
+      }
+      if (!evidence.usedCache || data.currentSnapshot?.id === data.snapshot.id) {
+        setSnapshot(data.snapshot);
+        setManualPromptDraft(data.snapshot.promptSource?.kind === 'manual' ? standard : '');
+      }
+      if (data.currentSnapshot !== undefined) {
+        setCurrentRules(data.currentSnapshot);
+      } else if (!evidence.usedCache) {
+        setCurrentRules(snapshotIdentity(data.snapshot));
+      }
+      setRefreshIssues((previous) => mergeIssues(evidence.usedCache ? previous : [], data.snapshot.refreshIssues, data.refreshIssues));
+      setContextError(null);
       setActiveAnalysis(data.analysis);
-      setAnalyses((prev) => [data.analysis, ...prev]);
-      setPart1Original(data.part1OriginalPrompt);
+      setAnalyses((prev) => [data.analysis, ...prev.filter((item) => item.id !== data.analysis.id)]);
+      setEditorSource({ part1: standard, snapshotId: evidence.snapshotId, rulesHash: evidence.rulesHash, analysisId: data.analysis.id, legacy: false });
+      setStaleAcknowledgment(null);
       setPart2Enhancement(data.part2AiEnhancement);
       setPart3Guidelines(data.part3ExecutionGuidelines);
-      if (bounty) {
-        const customOnly = selectedSkills.filter((s) => s.source === 'founder_custom');
-        setSelectedSkills(
-          mergeRecommendedSkills({
-            officialSkills: extractOfficialBountySkills(bounty),
-            aiSkills: data.recommendedSkills || data.analysis?.recommendedSkills || [],
-            customSkills: customOnly,
-          })
-        );
-      } else if (Array.isArray(data.recommendedSkills)) {
-        setSelectedSkills(data.recommendedSkills);
-      }
+      setFounderInstructions(instructions);
+      setSelectedSkills((previous) => mergeRecommendedSkills({
+        officialSkills: bounty ? extractOfficialBountySkills(bounty) : [],
+        aiSkills: data.recommendedSkills ?? data.analysis.recommendedSkills ?? [],
+        customSkills: previous.filter((skill) => skill.source === 'founder_custom'),
+      }));
       setEditSummary(`AI generated with ${data.analysis.model}`);
-      setSaveNotice(
-        'AI analysis & optimal skill stack generated. Review skills or prompt below, then click "Save New Version" to persist to SQLite.'
-      );
+      setSaveNotice('AI enhancement is ready to review and save as a new version.');
       onDataMutated();
     } catch (err) {
-      setEnhanceError(err instanceof Error ? err.message : 'Network failure during enhancement');
+      if (request.isCurrent()) setEnhanceError(errorMessage(err, 'Network failure during enhancement.'));
     } finally {
-      stageTimers.forEach(clearTimeout);
-      setEnhancing(false);
-      setEnhanceStageLabel('');
+      if (request.finish()) setEnhancing(false);
     }
   };
 
@@ -370,20 +619,116 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
     setShowAddSkill(false);
   };
 
+  const verifyRulesBeforeReuse = async () => {
+    if (!canStart() || !canUseEditor || !sourceSnapshotId || !sourceRulesHash) return null;
+    const request = requestGuard.begin('reuse', selectedSlug);
+    if (!request) return null;
+    // Keep the editor bound to its original source while the current snapshot advances.
+    setEditorSource((previous) => previous ?? {
+      part1: part1Original,
+      snapshotId: sourceSnapshotId,
+      rulesHash: sourceRulesHash,
+      analysisId: null,
+      legacy: false,
+    });
+    setCheckingReuseRules(true);
+    setEnhanceError(null);
+    setSaveNotice(null);
+    let accepted = false;
+    let observedSnapshot = snapshotIdentity(snapshot);
+    try {
+      const res = await fetch(`/api/bounties/${encodeURIComponent(selectedSlug)}?refresh=1`, {
+        signal: request.signal,
+      });
+      const data = await readStudioJson<BountyContext>(res);
+      if (!request.isCurrent()) return null;
+      if (!res.ok) throw new Error(data.error || 'Could not verify the current bounty rules.');
+      if (data.bounty?.slug !== selectedSlug || (data.snapshot && data.snapshot.bountySlug !== selectedSlug)) {
+        setContextError('The rules refresh did not match the selected bounty.');
+        setStaleAcknowledgment(null);
+        return null;
+      }
+      observedSnapshot = snapshotIdentity(data.snapshot);
+      if (!data.snapshot) throw new Error('The current rules snapshot is unavailable.');
+      setSnapshot(data.snapshot);
+      const issues = mergeIssues(data.snapshot.refreshIssues, data.refreshIssues,
+        data.refreshError ? [data.refreshError] : []);
+      setRefreshIssues(issues);
+      if (data.refreshError || data.snapshot.requirementsComplete !== true || !data.snapshot.rulesHash?.trim()) {
+        throw new Error(data.refreshError || 'The current official rules could not be verified completely.');
+      }
+      setSnapshot(data.snapshot);
+      setCurrentRules(snapshotIdentity(data.snapshot));
+      setReuseRulesFailure(null);
+      setContextError(null);
+      const changed = data.snapshot.rulesHash !== sourceRulesHash;
+      const currentKey = JSON.stringify([selectedSlug, sourceSnapshotId, sourceRulesHash, data.snapshot.rulesHash]);
+      if (changed && staleAcknowledgment !== currentKey) {
+        setStaleAcknowledgment(null);
+        setEnhanceError('Official rules changed since this prompt source. Review the stale-rules warning and acknowledge it before retrying Copy, export, or Save.');
+        return null;
+      }
+      accepted = true;
+      return {
+        request,
+        allowStaleRules: changed,
+        expectedCurrentRulesHash: data.snapshot.rulesHash,
+        expectedCurrentSnapshotId: data.snapshot.id,
+        expectedCurrentSnapshotHash: data.snapshot.contentHash,
+      };
+    } catch (err) {
+      if (!request.isCurrent()) return null;
+      const failure = errorMessage(err, 'Could not verify the current bounty rules.');
+      const unknownKey = JSON.stringify([selectedSlug, sourceSnapshotId, sourceRulesHash, 'unknown']);
+      setCurrentRules(null);
+      setContextError(null);
+      setReuseRulesFailure(failure);
+      setRefreshIssues((previous) => mergeIssues(previous, [failure]));
+      if (staleAcknowledgment === unknownKey) {
+        accepted = true;
+        return {
+          request,
+          allowStaleRules: true,
+          expectedCurrentRulesHash: null,
+          expectedCurrentSnapshotId: observedSnapshot?.id ?? null,
+          expectedCurrentSnapshotHash: observedSnapshot?.contentHash ?? null,
+        };
+      }
+      setStaleAcknowledgment(null);
+      return null;
+    } finally {
+      if (request.isCurrent()) setCheckingReuseRules(false);
+      if (!accepted) request.finish();
+    }
+  };
+
   const handleSaveVersion = async () => {
-    if (!selectedSlug || !part2Enhancement.trim() || !part3Guidelines.trim()) {
-      setEnhanceError('Part 2 Enhancement and Part 3 Execution Guidelines must be populated before saving a version.');
+    if (!canStart() || !canUseEditor || !sourceSnapshotId) return;
+    if (part2Enhancement.trim().length < 10 || part3Guidelines.trim().length < 10) {
+      setEnhanceError('Part 2 Enhancement and Part 3 Execution Guidelines must each contain at least 10 characters.');
       return;
     }
+    const verified = await verifyRulesBeforeReuse();
+    if (!verified || !verified.request.isCurrent()) return;
+    const request = requestGuard.begin('save', selectedSlug);
+    verified.request.finish();
+    if (!request) return;
     setSavingVersion(true);
     setEnhanceError(null);
+    setUncoveredGateError([]);
     setSaveNotice(null);
     try {
       const res = await fetch(`/api/prompts/${encodeURIComponent(selectedSlug)}/versions`, {
         method: 'POST',
+        signal: request.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          analysisId: activeAnalysis?.id || null,
+          analysisId: editorSource?.analysisId ?? null,
+          sourceSnapshotId,
+          allowStaleRules: verified.allowStaleRules,
+          expectedCurrentRulesHash: verified.expectedCurrentRulesHash,
+          expectedCurrentSnapshotId: verified.expectedCurrentSnapshotId,
+          expectedCurrentSnapshotHash: verified.expectedCurrentSnapshotHash,
           part1OriginalPrompt: part1Original,
           part2AiEnhancement: part2Enhancement,
           part3ExecutionGuidelines: part3Guidelines,
@@ -394,11 +739,26 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
           createdBy: 'Founder',
         }),
       });
-      const data = await res.json();
+      const data = await readStudioJson<StudioApiError & {
+        draft: PromptDraftRecord;
+        version: PromptVersionRecord;
+        currentSnapshot?: CachedSnapshot | null;
+      }>(res);
+      if (!request.isCurrent()) return;
       if (!res.ok) {
-        setEnhanceError(data.error || 'Failed to save prompt version.');
-        return;
+        if (res.status === 409) {
+          setStaleAcknowledgment(null);
+          if (data.currentSnapshot !== undefined) setCurrentRules(data.currentSnapshot);
+          else setContextError('Refresh Official to check the current rules before copying or saving.');
+        }
+        throw new Error(data.error || 'Failed to save prompt version.');
       }
+      if (data.version?.bountySlug !== selectedSlug || data.version.sourceSnapshotId !== sourceSnapshotId ||
+          data.version.part1OriginalPrompt !== part1Original || data.version.sourceRulesHash !== sourceRulesHash ||
+          data.version.provenanceStatus !== 'verified') {
+        throw new Error('The saved version did not match its recorded source. Refresh Official to view server history.');
+      }
+      setEditorSource(versionSource(data.version));
       setDraft(data.draft);
       setVersions((prev) => [data.version, ...prev]);
       setDiffTargetId(data.version.id);
@@ -406,33 +766,62 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
       setEditSummary('');
       setSaveNotice(`Saved Version v${data.version.versionNumber} (including curated skill directives) to SQLite.`);
       onDataMutated();
+    } catch (err) {
+      if (request.isCurrent()) setEnhanceError(errorMessage(err, 'Failed to save prompt version.'));
     } finally {
-      setSavingVersion(false);
+      if (request.finish()) setSavingVersion(false);
     }
   };
 
-  const handleLoadVersionIntoEditor = (v: PromptVersionRecord) => {
-    setPart1Original(v.part1OriginalPrompt);
-    setPart2Enhancement(v.part2AiEnhancement);
-    setPart3Guidelines(v.part3ExecutionGuidelines);
-    setFounderInstructions(v.founderInstructions);
-    if (v.selectedSkills && v.selectedSkills.length > 0) {
-      setSelectedSkills(v.selectedSkills);
-    } else if (bounty) {
-      setSelectedSkills(
-        mergeRecommendedSkills({
-          officialSkills: extractOfficialBountySkills(bounty),
-          aiSkills: activeAnalysis?.recommendedSkills || [],
-        })
-      );
-    }
-    setSaveNotice(`Loaded saved version v${v.versionNumber} into editor.`);
+  const handleLoadVersionIntoEditor = (version: PromptVersionRecord) => {
+    if (!canStart() || version.bountySlug !== selectedSlug) return;
+    const analysis = analyses.find((item) => item.id === version.analysisId) ?? null;
+    setActiveAnalysis(analysis);
+    setEditorSource(versionSource(version));
+    setCacheOffer(null);
+    setStaleAcknowledgment(null);
+    setPart2Enhancement(version.part2AiEnhancement);
+    setPart3Guidelines(version.part3ExecutionGuidelines);
+    setFounderInstructions(version.founderInstructions);
+    setSelectedSkills(version.selectedSkills?.length ? version.selectedSkills : mergeRecommendedSkills({
+      officialSkills: bounty ? extractOfficialBountySkills(bounty) : [],
+      aiSkills: analysis?.recommendedSkills ?? [],
+    }));
+    setPreviewTab('preview');
+    setSaveNotice(`Loaded saved version v${version.versionNumber} into the editor.`);
+  };
+
+  const handleAdoptCurrentSource = () => {
+    if (!canStart() || !editorSource?.legacy || !standardPrompt || !snapshot?.id || !snapshot.rulesHash) return;
+    const linked = analyses.find((analysis) => analysis.id === draft?.latestVersion?.analysisId)?.evidence;
+    setEditorSource({
+      part1: standardPrompt,
+      snapshotId: snapshot.id,
+      rulesHash: snapshot.rulesHash,
+      analysisId: linked?.snapshotId === snapshot.id && linked.rulesHash === snapshot.rulesHash ? draft?.latestVersion?.analysisId ?? null : null,
+      legacy: false,
+    });
+    setStaleAcknowledgment(null);
+    setSaveNotice('Part 1 now uses the current verified standard source. Review Parts 2 and 3 against the current rules before saving.');
   };
 
   const handleCopyPrompt = async () => {
-    await navigator.clipboard.writeText(assembledMasterPrompt);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
+    if (!canStart() || !canUseEditor) return;
+    const verified = await verifyRulesBeforeReuse();
+    if (!verified || !verified.request.isCurrent()) return;
+    const request = requestGuard.begin('copy', selectedSlug);
+    verified.request.finish();
+    if (!request) return;
+    try {
+      await navigator.clipboard.writeText(assembledMasterPrompt);
+      if (!request.isCurrent()) return;
+      setCopied(true);
+      window.setTimeout(() => {
+        if (request.finish()) setCopied(false);
+      }, 1800);
+    } catch (err) {
+      if (request.finish()) setEnhanceError(errorMessage(err, 'Failed to copy the master prompt.'));
+    }
   };
 
   const diffResult = useMemo(() => {
@@ -446,11 +835,15 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
   const deliverables = Array.isArray(rawReq.deliverables)
     ? (rawReq.deliverables as Array<{ name?: string; kind?: string; description?: string }>)
     : [];
-  const checks = Array.isArray(rawReq.checks)
-    ? (rawReq.checks as Array<{ check?: string; title?: string; applies?: boolean }>).filter(
-        (c) => c.applies !== false
-      )
-    : [];
+  const checks = Array.isArray(rawReq.checks) ? rawReq.checks.map((check, index) => {
+    const record = check && typeof check === 'object' ? check as Record<string, unknown> : {};
+    const id = record.check ?? record.gateId ?? record.id;
+    return {
+      id: typeof id === 'string' && id.trim() ? id : `unidentified-gate-${index + 1}`,
+      title: typeof record.title === 'string' ? record.title : '',
+      applies: record.applies !== false,
+    };
+  }) : [];
 
   return (
     <div className="space-y-5">
@@ -462,11 +855,14 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
               <label className="block text-[11px] text-[#9CA3AF] mb-1">Active Bounty</label>
               <Select
                 value={selectedSlug}
-                onChange={(e) => setSelectedSlug(e.target.value)}
+                onChange={(e) => changeSelection(e.target.value)}
                 className="w-full"
                 aria-label="Select bounty"
               >
-                {bounties.length === 0 && <option value="">Sync bounties first...</option>}
+                {!selectedSlug && <option value="">{bounties.length ? 'Select a bounty...' : 'Sync bounties first...'}</option>}
+                {selectedSlug && !bounties.some((item) => item.slug === selectedSlug) && (
+                  <option value={selectedSlug}>{bounty?.title ?? selectedSlug}</option>
+                )}
                 {bounties.map((b) => (
                   <option key={b.slug} value={b.slug}>
                     [{b.status.toUpperCase()}] {b.title} ({formatUsd(b.potUsd || b.rewardAmount)})
@@ -475,45 +871,10 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
               </Select>
             </div>
 
-            <div className="w-56">
-              <label className="block text-[11px] text-[#9CA3AF] mb-1">LLM Provider & Model</label>
-              <Select
-                value={provider === 'openai_compatible' ? 'openai_compatible' : model}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  if (val === 'openai_compatible') {
-                    setProvider('openai_compatible');
-                    setModel(settings?.openaiCompatModel || 'llama3.1:8b');
-                  } else {
-                    setProvider('gemini');
-                    setModel(val);
-                  }
-                }}
-                className="w-full"
-                aria-label="Select LLM model"
-              >
-                {(settings?.availableModels || []).map((m) => (
-                  <option
-                    key={m.id}
-                    value={m.provider === 'openai_compatible' ? 'openai_compatible' : m.id}
-                  >
-                    {m.label} ({m.tier === 'free' ? 'Free Tier' : 'Paid Tier'})
-                  </option>
-                ))}
-              </Select>
+            <div className="min-w-0 max-w-56">
+              <div className="text-[11px] text-[#9CA3AF]">OpenAI-compatible model</div>
+              <div className="truncate text-xs text-[#D1D5DB] font-mono" title={model}>{model}</div>
             </div>
-
-            {provider === 'gemini' && (
-              <label className="inline-flex items-center gap-2 text-xs text-[#D1D5DB] pt-4 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={enableGrounding}
-                  onChange={(e) => setEnableGrounding(e.target.checked)}
-                  className="rounded border-white/20 bg-[#090B0E] accent-[#3B82F6]"
-                />
-                <span>Google Search Research</span>
-              </label>
-            )}
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0 pt-3 sm:pt-0">
@@ -521,32 +882,74 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
             <Button
               variant="secondary"
               size="sm"
-              onClick={() => selectedSlug && loadBountyContext(selectedSlug, true)}
-              disabled={loadingBounty || !selectedSlug}
+              onClick={() => {
+                if (requestGuard.slug === selectedSlug && !working &&
+                    !['context', 'enhance', 'save', 'manual', 'reuse'].some(requestGuard.isPending)) {
+                  void loadBountyContext(selectedSlug, true, contextMatches);
+                }
+              }}
+              disabled={working || !selectedSlug}
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loadingBounty ? 'animate-spin' : ''}`} />
               <span>Refresh Official</span>
             </Button>
             <Button
               variant="primary"
-              onClick={handleEnhanceWithAI}
-              disabled={enhancing || !selectedSlug}
+              onClick={() => void handleEnhanceWithAI()}
+              disabled={!canRunEnhancement}
             >
               <Sparkles className={`w-4 h-4 ${enhancing ? 'animate-spin' : ''}`} />
-              <span>{enhancing ? 'Enhancing...' : 'Enhance with AI'}</span>
+              <span>Enhance with AI</span>
             </Button>
           </div>
         </div>
 
-        {enhancing && enhanceStageLabel && (
-          <div className="mt-3 pt-3 border-t border-white/[0.07] text-xs font-mono text-[#3B82F6]">
-            {enhanceStageLabel}
+        {enhancing && (
+          <div role="status" className="mt-3 pt-3 border-t border-white/[0.07] text-xs font-mono text-[#3B82F6]">
+            Sedang menganalisis bounty
           </div>
         )}
 
+        {enhancementLog.length > 0 && (
+          <div className="mt-2 rounded-md border border-white/10 bg-[#090B0E] p-3">
+            <h3 className="text-xs font-semibold text-[#D1D5DB]" id="enhancement-log-title">Terminal log</h3>
+            <div ref={enhancementLogRef} role="log" aria-labelledby="enhancement-log-title" className="mt-2 max-h-44 space-y-1 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs text-[#D1D5DB]">
+              {enhancementLog.map(({ timestamp, message }, index) => (
+                <p key={index}>
+                  <time dateTime={timestamp} className="mr-2 text-[#9CA3AF]">{new Date(timestamp).toLocaleTimeString('id-ID')}</time>
+                  {message}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {loadingBounty && <p role="status" className="mt-3 text-xs text-[#9CA3AF]">Loading bounty context…</p>}
+        {checkingReuseRules && <p role="status" className="mt-3 text-xs text-[#9CA3AF]">Verifying current official rules…</p>}
+        {[listError, contextError].filter(Boolean).map((message, i) => (
+          <p key={i} role="alert" className="mt-3 rounded-md bg-[#EF4444]/10 border border-[#EF4444]/30 px-3.5 py-2.5 text-xs text-[#FCA5A5]">{message}</p>
+        ))}
+
         {enhanceError && (
           <div className="mt-3 rounded-md bg-[#EF4444]/10 border border-[#EF4444]/30 px-3.5 py-2.5 text-xs text-[#FCA5A5]">
-            {enhanceError}
+            <p role="alert">{enhanceError}</p>
+            {uncoveredGateError.length > 0 && (
+              <ul className="mt-1 list-disc pl-4" aria-label="Uncovered gates">
+                {uncoveredGateError.map((gate, index) => (
+                  <li key={index}>{gate.gateId}{gate.reason && ` — ${gate.reason}`}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {cacheOffer && (
+          <div className="mt-3 rounded-md bg-[#F59E0B]/10 border border-[#F59E0B]/30 px-3.5 py-2.5 text-xs text-[#FCD34D] space-y-2">
+            <p>Official refresh failed. Using this cached snapshot may omit newer rules.</p>
+            <p className="font-mono break-all">Snapshot #{cacheOffer.id} · {cacheOffer.contentHash}</p>
+            <Button variant="secondary" size="sm" disabled={!canEnhance} onClick={() => void handleEnhanceWithAI(cacheOffer)}>
+              Use cached snapshot from {formatDateTime(cacheOffer.fetchedAt)}
+            </Button>
           </div>
         )}
 
@@ -560,7 +963,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
       {!bounty ? (
         <Panel>
           <EmptyState
-            title="Select a bounty to open Prompt Studio"
+            title={contextError ? 'Bounty context failed to load' : loadingBounty ? 'Loading bounty context…' : 'Select a bounty to open Prompt Studio'}
             description="Choose an open or resolved make.fun competition above to inspect its verbatim official requirements and run AI enhancement."
           />
         </Panel>
@@ -568,22 +971,23 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
           {/* LEFT COLUMN: Panel 1 (Official Requirements) + Panel 2 (AI Analysis) */}
           <div className="xl:col-span-6 space-y-5">
+            <BountyResearchPanel bounty={bounty} snapshot={researchSnapshot} leaderboard={leaderboardInsights}
+              refreshError={researchRefreshError} analysis={activeAnalysis} />
             {/* PANEL 1: Official Requirements Panel */}
             <Panel>
               <PanelHeader
                 title="1. Official Requirements Panel"
-                subtitle={`${bounty.category} · ${formatUsd(bounty.potUsd || bounty.rewardAmount)} · Provenance: ${
-                  snapshot?.manualPromptOverride ? 'manual_verified_paste' : 'make.fun official API'
-                }`}
+                subtitle={`${bounty.category} · ${formatUsd(bounty.potUsd || bounty.rewardAmount)}`}
                 actions={
                   <div className="flex items-center gap-2">
                     <Button
                       variant="ghost"
                       size="sm"
                       onClick={() => setShowManualPromptBox((v) => !v)}
+                      disabled={working}
                     >
                       <FileEdit className="w-3.5 h-3.5" />
-                      <span>Manual Override</span>
+                      <span>Paste Manual Source</span>
                     </Button>
                     <a
                       href={bounty.url}
@@ -598,26 +1002,56 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                 }
               />
               <div className="p-5 space-y-4 text-xs">
+                {!standardPrompt && (
+                  <p role="status" className="rounded-md bg-[#F59E0B]/10 border border-[#F59E0B]/30 px-3.5 py-2.5 text-[#FCD34D]">
+                    No verified standard prompt source is available. Refresh Official or paste the exact prompt from the bounty page as a manual source.
+                  </p>
+                )}
+                <dl className="grid gap-x-3 gap-y-1 sm:grid-cols-[auto_minmax(0,1fr)] text-[11px] text-[#9CA3AF]">
+                  <dt>Source kind</dt><dd>{standardPrompt ? snapshot?.promptSource?.kind : 'Unavailable'}</dd>
+                  <dt>Source locator</dt><dd className="break-all">{standardPrompt ? snapshot?.promptSource?.locator : '—'}</dd>
+                  <dt>Source captured</dt><dd>{standardPrompt && snapshot?.promptSource ? formatDateTime(snapshot.promptSource.capturedAt) : '—'}</dd>
+                  <dt>Snapshot ID</dt><dd className="font-mono">{snapshot?.id ?? '—'}</dd>
+                  <dt>Snapshot hash</dt><dd className="font-mono break-all">{snapshot?.contentHash ?? '—'}</dd>
+                  <dt>Requirements complete</dt><dd>{snapshot?.requirementsComplete === true ? 'Yes' : snapshot?.requirementsComplete === false ? 'No' : 'Unknown'}</dd>
+                </dl>
+                {refreshIssues.length > 0 && (
+                  <div className="rounded-md bg-[#F59E0B]/10 border border-[#F59E0B]/30 px-3.5 py-2.5 text-[#FCD34D]">
+                    <p className="font-semibold">Official refresh issues</p>
+                    <ul className="list-disc pl-4 mt-1">
+                      {refreshIssues.map((issue) => <li key={issue}>{issue}</li>)}
+                    </ul>
+                  </div>
+                )}
                 {showManualPromptBox && (
                   <div className="space-y-2 pb-4 border-b border-white/[0.07]">
                     <p className="text-[#9CA3AF]">
-                      If the official API omitted part of the competition prompt, paste verified official text from the competition page below (tagged separately as manual override).
+                      If Make.fun’s standard prompt is unavailable, paste the entire prompt from the competition page. The source will be labeled Manual input.
                     </p>
                     <Textarea
                       rows={5}
                       value={manualPromptDraft}
                       onChange={(e) => setManualPromptDraft(e.target.value)}
+                      onPaste={(event) => {
+                        const { value, selectionStart, selectionEnd } = event.currentTarget;
+                        if (selectionStart !== 0 || selectionEnd !== value.length) return;
+                        const text = event.clipboardData.getData('text/plain');
+                        if (!text) return;
+                        event.preventDefault();
+                        setManualPromptDraft(text);
+                      }}
                       placeholder="Paste verified official prompt text..."
                       className="font-mono text-xs"
+                      disabled={working}
                     />
                     <div className="flex items-center gap-2">
                       <Button
                         variant="primary"
                         size="sm"
                         onClick={handleSaveManualPrompt}
-                        disabled={savingManualPrompt}
+                        disabled={working || !manualPromptDraft.trim()}
                       >
-                        {savingManualPrompt ? 'Saving...' : 'Save Official Override'}
+                        {savingManualPrompt ? 'Saving…' : 'Save Manual Prompt'}
                       </Button>
                       <Button
                         variant="ghost"
@@ -640,7 +1074,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                     </span>
                   </div>
                   <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed bg-[#090B0E] border border-white/[0.07] rounded-md p-3.5 text-[#D1D5DB] max-h-56 overflow-y-auto">
-                    {part1Original || 'No official prompt text available.'}
+                    {standardPrompt}
                   </pre>
                 </div>
 
@@ -661,11 +1095,11 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                 {checks.length > 0 && (
                   <div>
                     <h4 className="font-semibold text-[#F3F4F6] mb-1">
-                      Verified Gate Checks ({checks.length} active)
+                      Official Gate Checks ({checks.filter((check) => check.applies).length} active)
                     </h4>
                     <div className="flex flex-wrap gap-x-3 gap-y-1 font-mono text-[11px] text-[#9CA3AF]">
-                      {checks.slice(0, 14).map((c, i) => (
-                        <span key={i}>{c.check}</span>
+                      {checks.map((check, i) => (
+                        <span key={i}>{check.id}{check.title && ` — ${check.title}`}{!check.applies && ' (not applicable)'}</span>
                       ))}
                     </div>
                   </div>
@@ -765,6 +1199,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                   analyses.length > 1 && (
                     <Select
                       value={activeAnalysis?.id || ''}
+                      disabled={working}
                       onChange={(e) => {
                         const found = analyses.find((a) => a.id === e.target.value);
                         if (found) {
@@ -798,7 +1233,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                   title="No AI analysis generated for this bounty yet"
                   description="Prompt Studio never generates drafts automatically. Click Enhance with AI above when you are ready to analyze this competition."
                   action={
-                    <Button variant="primary" size="sm" onClick={handleEnhanceWithAI} disabled={enhancing}>
+                    <Button variant="primary" size="sm" onClick={() => void handleEnhanceWithAI()} disabled={!canRunEnhancement}>
                       <Sparkles className="w-3.5 h-3.5" />
                       <span>Enhance with AI</span>
                     </Button>
@@ -806,6 +1241,35 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                 />
               ) : (
                 <div className="p-5 space-y-5 text-xs leading-relaxed">
+                  {analysisEvidence ? (
+                    <div className="space-y-2 rounded-md bg-[#090B0E] border border-white/[0.07] p-3">
+                      <h4 className="font-semibold text-[#F3F4F6]">Analysis Evidence</h4>
+                      <dl className="grid gap-x-3 gap-y-1 sm:grid-cols-[auto_minmax(0,1fr)] text-[11px] text-[#9CA3AF]">
+                        <dt>Snapshot ID</dt><dd className="font-mono">{analysisEvidence.snapshotId}</dd>
+                        <dt>Snapshot hash</dt><dd className="font-mono break-all">{analysisEvidence.snapshotHash}</dd>
+                        <dt>Rules hash</dt><dd className="font-mono break-all">{analysisEvidence.rulesHash}</dd>
+                        <dt>Context hash</dt><dd className="font-mono break-all">{analysisEvidence.contextHash}</dd>
+                        <dt>Context fetched</dt><dd>{formatDateTime(analysisEvidence.contextFetchedAt)}</dd>
+                        <dt>Used cache</dt><dd>{analysisEvidence.usedCache ? 'Yes' : 'No'}</dd>
+                        <dt>Source kind</dt><dd>{analysisEvidence.promptSource.kind}</dd>
+                        <dt>Source locator</dt><dd className="break-all">{analysisEvidence.promptSource.locator}</dd>
+                        <dt>Source captured</dt><dd>{formatDateTime(analysisEvidence.promptSource.capturedAt)}</dd>
+                      </dl>
+                      <h5 className="font-semibold text-[#F3F4F6]">Gate Coverage ({coverage.filter((gate) => gate.status === 'uncovered').length} uncovered)</h5>
+                      {coverage.length === 0 ? <p className="text-[#9CA3AF]">No applicable gates were recorded for this run.</p> : (
+                        <ul className="space-y-1">
+                          {coverage.map((gate, index) => (
+                            <li key={index} className={gate.status === 'uncovered' ? 'text-[#FCD34D]' : 'text-[#D1D5DB]'}>
+                              <span className="font-mono">{gate.gateId}</span> · {gate.status}
+                              {gate.reason && <p>{gate.reason}</p>}
+                              {gate.verification && <p>Verification: {gate.verification}</p>}
+                              {gate.evidence && <p>Evidence: {gate.evidence}</p>}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ) : <p className="text-[#FCD34D]">This saved analysis has no snapshot evidence or gate coverage.</p>}
                   <div>
                     <h4 className="font-semibold text-[#F3F4F6] mb-1">Objective & Core Strategy</h4>
                     <p className="text-[#D1D5DB]">{activeAnalysis.objectiveSummary}</p>
@@ -948,7 +1412,7 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                     variant="primary"
                     size="sm"
                     onClick={handleSaveVersion}
-                    disabled={savingVersion}
+                    disabled={!canUseEditor}
                   >
                     <Save className="w-3.5 h-3.5" />
                     <span>{savingVersion ? 'Saving...' : 'Save New Version'}</span>
@@ -956,6 +1420,34 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                 }
               />
               <div className="p-5 space-y-4">
+                {editorSource?.legacy && (
+                  <div role="status" className="space-y-2 rounded-md bg-[#F59E0B]/10 border border-[#F59E0B]/30 px-3.5 py-2.5 text-xs text-[#FCD34D]">
+                    <p><span className="font-mono">legacy_unverified</span> · This saved Part 1 has no verified source. Copy, export, and save are disabled until you adopt the current standard prompt or supply a manual source. Enhancement can be run against a refreshed verified context; doing so replaces this legacy Part 1 in the editor.</p>
+                    <pre className="whitespace-pre-wrap font-mono max-h-56 overflow-y-auto">{editorSource.part1}</pre>
+                    {standardPrompt && (
+                      <Button variant="secondary" size="sm" disabled={working} onClick={handleAdoptCurrentSource}>
+                        Use current standard prompt
+                      </Button>
+                    )}
+                    {!standardPrompt && (
+                      <p>Paste and save the exact prompt from the competition page to replace the unverified Part 1 source.</p>
+                    )}
+                  </div>
+                )}
+                {staleKey && (
+                  <div className="space-y-2 rounded-md bg-[#F59E0B]/10 border border-[#F59E0B]/30 px-3.5 py-2.5 text-xs text-[#FCD34D]">
+                    <p role="status">{currentRules
+                      ? `Stale rules · This editor uses snapshot #${sourceSnapshotId}. The current snapshot #${currentRules.id} does not match its rules hash. Run Enhance with AI again for the current rules, or acknowledge the older rules below.`
+                      : `Current rules unavailable · This editor uses snapshot #${sourceSnapshotId}, but the latest rules could not be verified. Copy, export, and Save require explicit acknowledgment below.`}</p>
+                    {reuseRulesFailure && <p>{reuseRulesFailure}</p>}
+                    <label className="flex items-start gap-2">
+                      <input type="checkbox" checked={allowStaleRules} disabled={working} className="mt-0.5 accent-[#3B82F6]"
+                        onChange={(e) => setStaleAcknowledgment(e.target.checked ? staleKey : null)} />
+                      {currentRules ? 'I understand that Copy, export, and Save will use the older rules.'
+                        : 'I understand that the latest rules are unverified. Use the recorded source snapshot for Copy, export, and Save.'}
+                    </label>
+                  </div>
+                )}
                 {/* Agent Skill Playbook */}
                 <div className="rounded-md bg-[#090B0E] border border-white/[0.07] p-3.5 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1142,19 +1634,20 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                 subtitle="Ready to copy into Hermes (read-only command center — never executes prompts)"
                 actions={
                   <div className="flex items-center gap-2">
-                    <Button variant="secondary" size="sm" onClick={handleCopyPrompt}>
+                    <Button variant="secondary" size="sm" disabled={!canUseEditor} onClick={handleCopyPrompt}>
                       {copied ? <Check className="w-3.5 h-3.5 text-[#10B981]" /> : <Copy className="w-3.5 h-3.5" />}
                       <span>{copied ? 'Copied' : 'Copy'}</span>
                     </Button>
                     <Button
                       variant="secondary"
                       size="sm"
-                      onClick={() =>
-                        downloadMarkdownFile(
-                          `${bounty.slug}-cosmiclabs-master-prompt.md`,
-                          assembledMasterPrompt
-                        )
-                      }
+                      disabled={!canUseEditor}
+                      onClick={async () => {
+                        const verified = await verifyRulesBeforeReuse();
+                        if (!verified || !verified.request.isCurrent()) return;
+                        downloadMarkdownFile(`${bounty.slug}-cosmiclabs-master-prompt.md`, assembledMasterPrompt);
+                        verified.request.finish();
+                      }}
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Export .md</span>
@@ -1203,9 +1696,15 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
 
               <div className="p-5">
                 {previewTab === 'preview' && (
-                  <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed bg-[#090B0E] border border-white/[0.07] rounded-md p-4 text-[#E5E7EB] max-h-[460px] overflow-y-auto">
-                    {assembledMasterPrompt}
-                  </pre>
+                  canUseEditor ? (
+                    <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed bg-[#090B0E] border border-white/[0.07] rounded-md p-4 text-[#E5E7EB] max-h-[460px] overflow-y-auto">
+                      {assembledMasterPrompt}
+                    </pre>
+                  ) : (
+                    <div className="rounded-md bg-[#090B0E] border border-white/[0.07] p-4 text-xs text-[#9CA3AF]">
+                      Prompt preview requires a verified Part 1 source, nonblank Parts 2 and 3, and acknowledgment of any changed or unavailable current rules.
+                    </div>
+                  )
                 )}
 
                 {previewTab === 'versions' && (
@@ -1227,12 +1726,16 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                             </div>
                             <div className="text-[11px] text-[#9CA3AF] mt-0.5 font-mono">
                               {formatDateTime(v.createdAt)} · by {v.createdBy}
+                              <br />
+                              {versionSource(v).legacy ? 'legacy_unverified' : `verified · Snapshot #${v.sourceSnapshotId}`}
+                              {v.sourceRulesHash && <p className="break-all">Rules hash: {v.sourceRulesHash}</p>}
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
                             <Button
                               variant="secondary"
                               size="sm"
+                              disabled={working}
                               onClick={() => handleLoadVersionIntoEditor(v)}
                             >
                               Load into Editor
@@ -1240,13 +1743,21 @@ export const PromptStudioView: React.FC<PromptStudioViewProps> = ({
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() =>
-                                downloadMarkdownFile(`${bounty.slug}-v${v.versionNumber}.md`, v.fullMarkdown)
-                              }
+                              disabled={working || versionSource(v).legacy}
+                              title={versionSource(v).legacy ? 'Legacy Part 1 source is unverified' : 'Review this version in the editor before export'}
+                              onClick={() => {
+                                if (!canStart()) return;
+                                handleLoadVersionIntoEditor(v);
+                                setSaveNotice(`Loaded saved version v${v.versionNumber}. Review it, then use Export .md to verify current rules before downloading.`);
+                              }}
                             >
                               <Download className="w-3.5 h-3.5" />
                             </Button>
                           </div>
+                          <details className="w-full text-xs text-[#9CA3AF]">
+                            <summary className="cursor-pointer">View saved Markdown</summary>
+                            <pre className="mt-2 whitespace-pre-wrap font-mono max-h-72 overflow-y-auto text-[#E5E7EB]">{v.fullMarkdown}</pre>
+                          </details>
                         </div>
                       ))
                     )}

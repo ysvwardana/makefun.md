@@ -150,6 +150,9 @@ test('Drizzle Snapshots, AI Analyses, Prompt Versions (transactional) & Cascade 
       officialPromptText: 'Build a 4KB chess engine.',
       fetchedAt: '2026-11-18T02:00:00Z',
       contentHash: 'hash-1',
+      rulesHash: 'rules-1',
+      requirementsComplete: true,
+      promptSource: { kind: 'official_api', locator: 'https://make.fun/api/competitions/tiny-chess-01#/prompt', bountySlug: 'tiny-chess-01', capturedAt: '2026-11-18T02:00:00Z' },
     });
     assert.equal(snap1.officialPromptText, 'Build a 4KB chess engine.');
 
@@ -162,8 +165,8 @@ test('Drizzle Snapshots, AI Analyses, Prompt Versions (transactional) & Cascade 
     // AI Analysis CRUD
     const analysis = crud.createAIAnalysis({
       bountySlug: 'tiny-chess-01',
-      provider: 'gemini',
-      model: 'gemini-4-hydrogen',
+      provider: 'openai_compatible',
+      model: 'llama3.1:8b',
       stageStatus: 'completed_4_stage_pipeline',
       objectiveSummary: '4096 byte compressed chess bot.',
       mandatoryRequirements: ['Single file <= 4096 bytes'],
@@ -199,11 +202,18 @@ test('Drizzle Snapshots, AI Analyses, Prompt Versions (transactional) & Cascade 
           enabled: true,
         },
       ],
+      evidence: {
+        snapshotId: snapWithOverride.id, snapshotHash: snapWithOverride.contentHash,
+        rulesHash: snapWithOverride.rulesHash!, contextHash: 'exact-sent-context-hash',
+        contextFetchedAt: snapWithOverride.fetchedAt, usedCache: false,
+        promptSource: snapWithOverride.promptSource!, gateCoverage: [], contextSections: ['standardPrompt', 'requirements'],
+      },
       rawLlmResponse: '{"ok":true}',
       tokenUsage: { promptTokens: 100, completionTokens: 200, totalTokens: 300 },
     });
     const fetchedAnalysis = crud.getAIAnalysisById(analysis.id);
-    assert.equal(fetchedAnalysis?.model, 'gemini-4-hydrogen');
+    assert.equal(fetchedAnalysis?.provider, 'openai_compatible');
+    assert.equal(fetchedAnalysis?.model, 'llama3.1:8b');
     assert.equal(fetchedAnalysis?.recommendedSkills?.[0]?.name, 'PeSTO Tapered Eval');
     assert.equal(crud.listAIAnalysesByBounty('tiny-chess-01').length, 1);
 
@@ -212,7 +222,8 @@ test('Drizzle Snapshots, AI Analyses, Prompt Versions (transactional) & Cascade 
       bountySlug: 'tiny-chess-01',
       bountyTitle: 'Tiny Chess',
       analysisId: analysis.id,
-      part1OriginalPrompt: 'Build a 4KB chess engine.',
+      sourceSnapshotId: snapWithOverride.id,
+      part1OriginalPrompt: 'Verified full manual official rules text.',
       part2AiEnhancement: 'Use PeSTO + PVS.',
       part3ExecutionGuidelines: 'Stay under 4096 bytes.',
       founderInstructions: 'Python 3.13',
@@ -227,7 +238,8 @@ test('Drizzle Snapshots, AI Analyses, Prompt Versions (transactional) & Cascade 
       bountySlug: 'tiny-chess-01',
       bountyTitle: 'Tiny Chess',
       analysisId: analysis.id,
-      part1OriginalPrompt: 'Build a 4KB chess engine.',
+      sourceSnapshotId: snapWithOverride.id,
+      part1OriginalPrompt: 'Verified full manual official rules text.',
       part2AiEnhancement: 'Use PeSTO + PVS + CRC32 opening book.',
       part3ExecutionGuidelines: 'Stay under 4096 bytes and log 5+ turns.',
       founderInstructions: 'Python 3.13',

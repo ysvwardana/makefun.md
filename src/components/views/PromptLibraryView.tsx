@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Copy, Check, Download, ExternalLink, History, Sparkles } from 'lucide-react';
+import { ExternalLink, History, Sparkles } from 'lucide-react';
 import { Button, EmptyState, Panel, PanelHeader } from '../ui/primitives';
-import { downloadMarkdownFile, formatDateTime } from '../../lib/utils';
+import { formatDateTime } from '../../lib/utils';
 import type { PromptDraftRecord, PromptVersionRecord } from '../../types/command-center';
 
 interface PromptLibraryViewProps {
@@ -14,7 +14,6 @@ export const PromptLibraryView: React.FC<PromptLibraryViewProps> = ({ onOpenProm
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [versions, setVersions] = useState<PromptVersionRecord[]>([]);
   const [activeVersion, setActiveVersion] = useState<PromptVersionRecord | null>(null);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/prompts')
@@ -40,11 +39,6 @@ export const PromptLibraryView: React.FC<PromptLibraryViewProps> = ({ onOpenProm
     }
   };
 
-  const handleCopy = async (v: PromptVersionRecord) => {
-    await navigator.clipboard.writeText(v.fullMarkdown);
-    setCopiedId(v.id);
-    setTimeout(() => setCopiedId(null), 1600);
-  };
 
   return (
     <div className="space-y-5">
@@ -114,27 +108,6 @@ export const PromptLibraryView: React.FC<PromptLibraryViewProps> = ({ onOpenProm
               actions={
                 activeVersion && (
                   <div className="flex items-center gap-2">
-                    <Button variant="secondary" size="sm" onClick={() => handleCopy(activeVersion)}>
-                      {copiedId === activeVersion.id ? (
-                        <Check className="w-3.5 h-3.5 text-[#10B981]" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                      <span>{copiedId === activeVersion.id ? 'Copied' : 'Copy'}</span>
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() =>
-                        downloadMarkdownFile(
-                          `${activeVersion.bountySlug}-v${activeVersion.versionNumber}.md`,
-                          activeVersion.fullMarkdown
-                        )
-                      }
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Export .md</span>
-                    </Button>
                     <Button
                       variant="primary"
                       size="sm"
@@ -148,6 +121,10 @@ export const PromptLibraryView: React.FC<PromptLibraryViewProps> = ({ onOpenProm
               }
             />
             <div className="p-5 space-y-4">
+              {activeVersion && <div className="text-xs text-[#FBBF24]" role="status">
+                {activeVersion.provenanceStatus !== 'verified' ? 'Legacy — sumber Part 1 belum terbukti. ' : 'Riwayat sumber tersimpan; aturan terbaru belum diperiksa. '}
+                Buka Studio untuk meninjau versi dan aturan sebelum Copy atau ekspor Master Prompt.
+              </div>}
               {versions.length > 0 && (
                 <div className="flex flex-wrap items-center gap-2 pb-3 border-b border-white/[0.07]">
                   <History className="w-3.5 h-3.5 text-[#9CA3AF]" />

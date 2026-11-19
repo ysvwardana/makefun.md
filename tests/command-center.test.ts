@@ -25,7 +25,7 @@ test('computeLineDiff identifies additions and removals across prompt versions',
 });
 
 test('buildMasterMarkdown preserves Part 1 verbatim and separates all 3 parts', () => {
-  const part1 = 'EXACT OFFICIAL TEXT — DO NOT ALTER 4096 BYTES.';
+  const part1 = '  \r\nEXACT OFFICIAL TEXT — DO NOT ALTER 4096 BYTES.\r\n\n  ';
   const md = buildMasterMarkdown({
     bountyTitle: 'Tiny Chess',
     bountySlug: 'tiny-chess-01',
@@ -42,7 +42,7 @@ test('buildMasterMarkdown preserves Part 1 verbatim and separates all 3 parts', 
   assert.ok(md.includes('Target Python 3.13.'));
 });
 
-test('extractOfficialPromptText preserves description, rules, and deliverables', () => {
+test('extractOfficialPromptText refuses to invent a standard prompt from research context', () => {
   const text = extractOfficialPromptText(
     {
       title: 'Test Bounty',
@@ -56,10 +56,8 @@ test('extractOfficialPromptText preserves description, rules, and deliverables',
       ],
     }
   );
-  assert.ok(text.includes('# Test Bounty'));
-  assert.ok(text.includes('Detailed prompt text'));
-  assert.ok(text.includes('Must be MIT licensed'));
-  assert.ok(text.includes('repo_url'));
+  assert.equal(text, '');
+  assert.equal(extractOfficialPromptText({ prompt: ' \r\nEXACT\t\n ' }, null), ' \r\nEXACT\t\n ');
 });
 
 test('extractLeaderboardInsights computes #1, house baseline, and @0xkeinara gap', () => {
@@ -226,6 +224,8 @@ test('buildMasterMarkdown injects only enabled skills into Agent Skill & Tooling
   });
 
   assert.ok(md.includes('### Agent Skill & Tooling Directives'));
+  assert.ok(md.includes('`skills_list()`'));
+  assert.ok(md.includes('`skill_view(name)`'));
   assert.ok(md.includes('zlib-self-extractor'));
   assert.ok(md.includes('Compress source with zlib.compress level 9.'));
   assert.ok(!md.includes('disabled-optional-tool'));

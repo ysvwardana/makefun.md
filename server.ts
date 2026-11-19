@@ -11,7 +11,6 @@ import {
   runBountyEnhancementWorkflow,
   testLLMConnection,
 } from './server/llm.ts';
-import { buildMasterMarkdown } from './src/lib/prompt-builder.ts';
 import {
   computeEffectiveSyncState,
   extractLeaderboardInsights,
@@ -19,19 +18,40 @@ import {
   syncSingleBountyDetails,
 } from './server/makefun.ts';
 import { evaluateTranscriptGates } from './server/transcript-gate.ts';
+import { resolveCompatibleBaseUrl } from './server/llm-policy.ts';
+import { createSyncCoordinator } from './server/sync-coordinator.ts';
+import { prepareEnhancement } from './server/enhancer-service.ts';
+import { studioSnapshot } from './server/studio-response.ts';
 import type { AppSettings, LLMProviderId } from './src/types/command-center.ts';
 
+const HOST = process.env.HOST?.trim() || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+
+const syncCoordinator = createSyncCoordinator({
+  sync: () => syncCompetitionsFromMakefun({ includeOpenFirst: true }),
+  getIntervalMinutes: () => Number(crud.getSettingValue('syncIntervalMinutes') || 30),
+});
+
+const boundedSetting = z.string().trim().min(1).max(200);
+const approvedBaseUrlSchema = z.string().trim().min(1).max(2048).transform((value, ctx) => {
+  try {
+    return resolveCompatibleBaseUrl(value);
+  } catch {
+    // Invalid endpoints and policy mismatches share a safe, actionable error.
+  }
+  ctx.addIssue({ code: 'custom', message: 'Endpoint must match server OPENAI_COMPAT_BASE_URL.' });
+  return z.NEVER;
+});
 
 function buildSettingsResponse(): AppSettings {
-  const provider = (crud.getSettingValue('provider') as LLMProviderId) || 'gemini';
+  const provider: LLMProviderId = 'openai_compatible';
+  const openaiCompatModel = crud.getSettingValue('openaiCompatModel') || 'llama3.1:8b';
   return {
     provider,
-    model: crud.getSettingValue('model') || 'gemini-4-hydrogen',
-    openaiCompatBaseUrl: crud.getSettingValue('openaiCompatBaseUrl') || 'http://localhost:11434/v1',
-    openaiCompatModel: crud.getSettingValue('openaiCompatModel') || 'llama3.1:8b',
-    allowPaidRequests: crud.getSettingValue('allowPaidRequests') === 'true',
-    enableSearchGrounding: crud.getSettingValue('enableSearchGrounding') === 'true',
+    model: openaiCompatModel,
+    openaiCompatBaseUrl: resolveCompatibleBaseUrl(),
+    openaiCompatModel,
     syncIntervalMinutes: Number(crud.getSettingValue('syncIntervalMinutes') || 30),
     accountHandle: crud.getSettingValue('accountHandle') || '@0xkeinara',
     permittedEvidencePaths: safeJsonParse<string[]>(
@@ -41,7 +61,6 @@ function buildSettingsResponse(): AppSettings {
     lastGlobalSyncAt: crud.getSettingValue('lastGlobalSyncAt') || null,
     nextCursor: crud.getSettingValue('nextCursor') || null,
     credentialStatus: {
-      geminiKeyConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
       openaiCompatKeyConfigured: Boolean(process.env.OPENAI_COMPAT_API_KEY?.trim()),
     },
     availableModels: AVAILABLE_MODELS,
@@ -49,7 +68,44 @@ function buildSettingsResponse(): AppSettings {
 }
 
 async function startServer() {
+  if (!LOOPBACK_HOSTS.has(HOST)) {
+    throw new Error('HOST must be 127.0.0.1, ::1, or localhost. Remote binding is not supported.');
+  }
+  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error('PORT must be an integer from 1 to 65535.');
+  }
+  resolveCompatibleBaseUrl(); // Fail closed on invalid server endpoint configuration.
   const app = express();
+  app.use('/api', (req, res, next) => {
+    const host = req.get('host');
+    let requestUrl: URL;
+    try {
+      if (!host || /[\s,/@?#\\]/.test(host)) throw new Error('Invalid Host');
+      requestUrl = new URL(`http://${host}`);
+      const hostname = requestUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      if (!LOOPBACK_HOSTS.has(hostname)) throw new Error('Non-loopback Host');
+    } catch {
+      res.status(403).json({ error: 'API access requires a loopback Host header.' });
+      return;
+    }
+    const origin = req.get('origin');
+    if (origin !== undefined) {
+      try {
+        const originUrl = new URL(origin);
+        if (originUrl.origin !== origin || originUrl.origin !== requestUrl.origin) throw new Error('Foreign Origin');
+      } catch {
+        res.status(403).json({ error: 'API Origin must match the request origin.' });
+        return;
+      }
+    }
+    // Bodyless CLI/UI actions remain supported; bodies must use JSON.
+    const hasBody = req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] || 0) > 0;
+    if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method) && hasBody && !req.is('application/json')) {
+      res.status(415).json({ error: 'API request bodies must use application/json.' });
+      return;
+    }
+    next();
+  });
   app.use(express.json({ limit: '5mb' }));
 
   // Health endpoint
@@ -66,13 +122,26 @@ async function startServer() {
     res.json(crud.getOverviewData(buildSettingsResponse(), computeEffectiveSyncState));
   });
 
+  app.get('/api/bounties/sync-status', (_req, res) => {
+    const status = syncCoordinator.getStatus();
+    res.json({ ...status,
+      lastSuccessAt: status.lastSuccessAt || crud.getSettingValue('lastGlobalSyncAt') || null,
+      lastAttemptAt: status.lastAttemptAt || crud.getSettingValue('lastGlobalSyncAttemptAt') || null,
+      lastError: status.lastError || crud.getSettingValue('lastGlobalSyncError') || null,
+    });
+  });
+
   // Bounties list (auto-syncs once if DB is empty)
   app.get('/api/bounties', async (req, res) => {
     const initial = crud.listBounties();
     let syncWarning: string | undefined;
     if (initial.items.length === 0) {
-      const syncResult = await syncCompetitionsFromMakefun({ includeOpenFirst: true });
-      if (syncResult.error) syncWarning = syncResult.error;
+      try {
+        const syncResult = await syncCoordinator.run() as { error?: string };
+        if (syncResult.error) syncWarning = syncResult.error;
+      } catch (err) {
+        syncWarning = err instanceof Error ? err.message : 'Initial bounty refresh failed.';
+      }
     }
 
     const { items, categories } = crud.listBounties(
@@ -96,8 +165,8 @@ async function startServer() {
   });
 
   app.post('/api/bounties/sync', async (_req, res) => {
-    const result = await syncCompetitionsFromMakefun({ includeOpenFirst: true });
-    res.json(result);
+    try { res.json(await syncCoordinator.run()); }
+    catch (err) { res.status(502).json({ error: err instanceof Error ? err.message : 'Bounty synchronization failed.' }); }
   });
 
   app.post('/api/bounties/load-more', async (_req, res) => {
@@ -118,11 +187,13 @@ async function startServer() {
     let snapshot = crud.getLatestBountySnapshot(slug);
 
     let refreshError: string | undefined;
-    if (forceRefresh || !bounty || !snapshot || !snapshot.rawRequirements) {
+    let refreshIssues: string[] = snapshot?.refreshIssues || [];
+    if (forceRefresh || !bounty || !snapshot || !snapshot.rawRequirements || !snapshot.promptSource || !snapshot.requirementsComplete) {
       const synced = await syncSingleBountyDetails(slug);
       refreshError = synced.error;
-      bounty = crud.getBountyBySlug(slug);
-      snapshot = crud.getLatestBountySnapshot(slug);
+      refreshIssues = synced.refreshIssues || [];
+      bounty = synced.bounty;
+      snapshot = synced.snapshot;
     }
 
     if (!bounty) {
@@ -142,12 +213,18 @@ async function startServer() {
 
     res.json({
       bounty,
-      snapshot,
+      snapshot: studioSnapshot(snapshot),
       leaderboardInsights,
       analyses,
+      analysisSourceSnapshot: (() => {
+        const id = analyses[0]?.evidence?.snapshotId;
+        const source = id ? crud.getBountySnapshotById(id) : null;
+        return source?.bountySlug === slug ? studioSnapshot(source) : null;
+      })(),
       draft,
       versions,
       refreshError,
+      refreshIssues,
     });
   });
 
@@ -183,9 +260,9 @@ async function startServer() {
 
   app.post('/api/bounties/:slug/manual-prompt', (req, res) => {
     const { slug } = req.params;
-    const body = z.object({ manualPromptText: z.string().min(10) }).safeParse(req.body);
+    const body = z.object({ manualPromptText: z.string().max(1000000).refine((value) => value.trim().length > 0) }).safeParse(req.body);
     if (!body.success) {
-      res.status(400).json({ error: 'Manual prompt must be at least 10 characters.' });
+      res.status(400).json({ error: 'Paste a nonempty exact standard prompt; whitespace is preserved.' });
       return;
     }
     const bounty = crud.getBountyBySlug(slug);
@@ -195,17 +272,17 @@ async function startServer() {
     }
 
     const snapshot = crud.upsertManualPromptOverride(slug, body.data.manualPromptText);
-    res.json({ ok: true, snapshot });
+    res.json({ ok: true, snapshot: studioSnapshot(snapshot) });
   });
 
   // CORE FEATURE: Genuine LLM Enhancement Workflow
   app.post('/api/enhancer/run', async (req, res) => {
     const schema = z.object({
       slug: z.string().min(1),
-      provider: z.enum(['gemini', 'openai_compatible']).optional(),
-      model: z.string().optional(),
-      enableGrounding: z.boolean().optional(),
-      founderInstructions: z.string().optional(),
+      provider: z.literal('openai_compatible').optional(),
+      model: boundedSetting.optional(),
+      founderInstructions: z.string().max(50000).optional(),
+      useCachedSnapshotId: z.number().int().positive().optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
@@ -213,42 +290,53 @@ async function startServer() {
       return;
     }
 
-    const { slug, provider, model, enableGrounding, founderInstructions } = parsed.data;
-
-    let bounty = crud.getBountyBySlug(slug);
-    let snapshot = crud.getLatestBountySnapshot(slug);
-
-    if (!bounty || !snapshot || !snapshot.rawRequirements) {
-      await syncSingleBountyDetails(slug);
-      bounty = crud.getBountyBySlug(slug);
-      snapshot = crud.getLatestBountySnapshot(slug);
+    const { slug, model, founderInstructions, useCachedSnapshotId } = parsed.data;
+    const controller = new AbortController();
+    const cancelOnDisconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.once('close', cancelOnDisconnect);
+    const streamProgress = req.get('accept') === 'application/x-ndjson';
+    if (streamProgress) {
+      res.type('application/x-ndjson').set('Cache-Control', 'no-store, no-transform');
+      res.flushHeaders();
     }
-
-    if (!bounty) {
-      res.status(404).json({ error: `Bounty "${slug}" not found.` });
-      return;
-    }
-
-    bounty.syncState = computeEffectiveSyncState(bounty);
-
-    try {
-      const result = await runBountyEnhancementWorkflow({
-        bounty,
-        snapshot,
-        providerOverride: provider,
-        modelOverride: model,
-        enableGroundingOverride: enableGrounding,
-        founderInstructions,
-      });
-      res.json(result);
-    } catch (err) {
-      if (err instanceof LLMConfigurationError) {
-        res.status(err.statusCode).json({ error: err.message });
-        return;
+    const logProgress = (message: string) => {
+      if (streamProgress && !res.destroyed) {
+        res.write(JSON.stringify({ type: 'progress', timestamp: new Date().toISOString(), message }) + '\n');
       }
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Unexpected LLM workflow error.',
+    };
+    const finish = (status: number, data: unknown) => {
+      if (streamProgress) res.end(JSON.stringify({ type: 'result', status, data }) + '\n');
+      else res.status(status).json(data);
+    };
+    try {
+      logProgress('Memperbarui detail dan aturan dari Make.fun.');
+      const prepared = await prepareEnhancement({ slug, useCachedSnapshotId }, {
+        refresh: syncSingleBountyDetails,
+        getSnapshot: crud.getBountySnapshotById,
+        getCached: crud.getLatestCompleteBountySnapshot,
+        getBounty: crud.getBountyBySlug,
       });
+      controller.signal.throwIfAborted();
+      logProgress(prepared.usedCache ? 'Menggunakan snapshot cache pilihan pengguna.' : 'Snapshot aturan terbaru siap.');
+      const result = await runBountyEnhancementWorkflow({
+        bounty: prepared.bounty,
+        snapshot: prepared.snapshot,
+        usedCache: prepared.usedCache,
+        signal: controller.signal,
+        modelOverride: model,
+        founderInstructions,
+        onProgress: logProgress,
+      });
+      logProgress('Analisis tersimpan dan Master Prompt siap ditinjau.');
+      finish(200, { ...result, snapshot: studioSnapshot(result.snapshot), currentSnapshot: prepared.currentSnapshot, refreshIssues: prepared.refreshIssues });
+    } catch (err) {
+      if (controller.signal.aborted || res.destroyed) return;
+      const failure = err as { statusCode?: number; details?: Record<string, unknown> };
+      const status = failure?.statusCode && failure.statusCode >= 400 && failure.statusCode < 600 ? failure.statusCode : 500;
+      logProgress(`Analisis berhenti (kode ${status}). Lihat rincian di bawah.`);
+      finish(status, { error: err instanceof Error ? err.message : 'Unexpected LLM workflow error.', ...failure?.details, details: failure?.details });
+    } finally {
+      res.removeListener('close', cancelOnDisconnect);
     }
   });
 
@@ -275,7 +363,12 @@ async function startServer() {
     });
     const schema = z.object({
       analysisId: z.string().nullable().optional(),
-      part1OriginalPrompt: z.string().min(10),
+      part1OriginalPrompt: z.string().optional(),
+      sourceSnapshotId: z.number().int().positive(),
+      allowStaleRules: z.boolean().optional(),
+      expectedCurrentRulesHash: z.string().min(1).nullable().optional(),
+      expectedCurrentSnapshotId: z.number().int().positive().optional(),
+      expectedCurrentSnapshotHash: z.string().min(1).optional(),
       part2AiEnhancement: z.string().min(10),
       part3ExecutionGuidelines: z.string().min(10),
       founderInstructions: z.string().optional().default(''),
@@ -297,33 +390,45 @@ async function startServer() {
       return;
     }
 
-    const fullMarkdown = buildMasterMarkdown({
-      bountyTitle: bounty.title,
-      bountySlug: bounty.slug,
-      bountyUrl: bounty.url,
-      part1OriginalPrompt: parsed.data.part1OriginalPrompt,
-      part2AiEnhancement: parsed.data.part2AiEnhancement,
-      part3ExecutionGuidelines: parsed.data.part3ExecutionGuidelines,
-      founderInstructions: parsed.data.founderInstructions,
-      selectedSkills: parsed.data.selectedSkills,
-    });
-
+    try {
+    const source = crud.getBountySnapshotById(parsed.data.sourceSnapshotId);
+    if (!source || source.bountySlug !== slug || !source.promptSource) {
+      res.status(409).json({ error: 'Select a proven source snapshot for this bounty before saving.' });
+      return;
+    }
+    const part1 = source.promptSource.kind === 'manual' ? source.manualPromptOverride || '' : source.officialPromptText;
+    if (parsed.data.part1OriginalPrompt !== undefined && parsed.data.part1OriginalPrompt !== part1) {
+      res.status(409).json({ error: 'Part 1 differs from the server source snapshot. Reload the exact source.' });
+      return;
+    }
     const result = crud.createPromptVersionTransactional({
       bountySlug: slug,
       bountyTitle: bounty.title,
       analysisId: parsed.data.analysisId ?? null,
-      part1OriginalPrompt: parsed.data.part1OriginalPrompt,
+      part1OriginalPrompt: part1,
+      sourceSnapshotId: source.id,
+      allowStaleRules: parsed.data.allowStaleRules,
+      expectedCurrentRulesHash: parsed.data.expectedCurrentRulesHash,
+      expectedCurrentSnapshotId: parsed.data.expectedCurrentSnapshotId,
+      expectedCurrentSnapshotHash: parsed.data.expectedCurrentSnapshotHash,
       part2AiEnhancement: parsed.data.part2AiEnhancement,
       part3ExecutionGuidelines: parsed.data.part3ExecutionGuidelines,
       founderInstructions: parsed.data.founderInstructions,
       selectedSkills: parsed.data.selectedSkills,
-      fullMarkdown,
+      fullMarkdown: '', // Rebuilt by CRUD using the authoritative server snapshot.
       editSummary: parsed.data.editSummary,
       founderNotes: parsed.data.founderNotes,
       createdBy: parsed.data.createdBy,
     });
 
     res.status(201).json(result);
+    } catch (err) {
+      const status = (err as { statusCode?: number })?.statusCode || 500;
+      res.status(status).json({ error: err instanceof Error ? err.message : 'Could not save prompt version.', currentSnapshot: (() => {
+        const latest = crud.getLatestBountySnapshot(slug);
+        return latest ? { id: latest.id, fetchedAt: latest.fetchedAt, contentHash: latest.contentHash, rulesHash: latest.rulesHash || '' } : null;
+      })() });
+    }
   });
 
   // Hermes Read-Only Evidence Monitor
@@ -631,16 +736,14 @@ async function startServer() {
 
   app.patch('/api/settings', (req, res) => {
     const schema = z.object({
-      provider: z.enum(['gemini', 'openai_compatible']).optional(),
-      model: z.string().min(1).optional(),
-      openaiCompatBaseUrl: z.string().optional(),
-      openaiCompatModel: z.string().optional(),
-      allowPaidRequests: z.boolean().optional(),
-      enableSearchGrounding: z.boolean().optional(),
-      syncIntervalMinutes: z.number().int().min(5).max(1440).optional(),
-      accountHandle: z.string().min(1).optional(),
-      permittedEvidencePaths: z.array(z.string()).optional(),
-    });
+      provider: z.literal('openai_compatible').optional(),
+      model: boundedSetting.optional(),
+      openaiCompatBaseUrl: approvedBaseUrlSchema.optional(),
+      openaiCompatModel: boundedSetting.optional(),
+        syncIntervalMinutes: z.number().int().min(5).max(1440).optional(),
+      accountHandle: z.string().trim().min(1).max(100).optional(),
+      permittedEvidencePaths: z.array(z.string().trim().min(1).max(1024)).max(50).optional(),
+    }).strict();
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid settings update.' });
@@ -648,21 +751,13 @@ async function startServer() {
     }
     const d = parsed.data;
     if (d.provider !== undefined) crud.setSettingValue('provider', d.provider);
-    if (d.model !== undefined) crud.setSettingValue('model', d.model);
-    if (d.openaiCompatBaseUrl !== undefined) {
-      crud.setSettingValue('openaiCompatBaseUrl', d.openaiCompatBaseUrl.trim());
-    }
-    if (d.openaiCompatModel !== undefined) {
-      crud.setSettingValue('openaiCompatModel', d.openaiCompatModel.trim());
-    }
-    if (d.allowPaidRequests !== undefined) {
-      crud.setSettingValue('allowPaidRequests', String(d.allowPaidRequests));
-    }
-    if (d.enableSearchGrounding !== undefined) {
-      crud.setSettingValue('enableSearchGrounding', String(d.enableSearchGrounding));
+    const model = d.openaiCompatModel ?? d.model;
+    if (model !== undefined) {
+      crud.setSettingValue('openaiCompatModel', model);
     }
     if (d.syncIntervalMinutes !== undefined) {
       crud.setSettingValue('syncIntervalMinutes', String(d.syncIntervalMinutes));
+      syncCoordinator.reschedule();
     }
     if (d.accountHandle !== undefined) {
       crud.setSettingValue('accountHandle', d.accountHandle.trim());
@@ -675,12 +770,11 @@ async function startServer() {
 
   app.post('/api/settings/test-llm', async (req, res) => {
     const schema = z.object({
-      provider: z.enum(['gemini', 'openai_compatible']).optional(),
-      model: z.string().optional(),
-      openaiCompatBaseUrl: z.string().optional(),
-      openaiCompatModel: z.string().optional(),
-      allowPaidRequests: z.boolean().optional(),
-    });
+      provider: z.literal('openai_compatible').optional(),
+      model: boundedSetting.optional(),
+      openaiCompatBaseUrl: approvedBaseUrlSchema.optional(),
+      openaiCompatModel: boundedSetting.optional(),
+    }).strict();
     const parsed = schema.safeParse(req.body || {});
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid test payload.' });
@@ -713,9 +807,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`COSMICLABS Make.fun Command Center listening on http://localhost:${PORT}`);
+  syncCoordinator.start();
+  const listener = app.listen(PORT, HOST, () => {
+    const displayHost = HOST === '::1' ? '[::1]' : HOST;
+    console.log(`COSMICLABS Make.fun Command Center listening on http://${displayHost}:${PORT}`);
   });
+  const shutdown = () => { syncCoordinator.stop(); listener.close(() => process.exit(0)); };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 startServer().catch((err) => {

@@ -15,9 +15,17 @@ Pusat kendali **local-first, read-only, dan evidence-first** milik **COSMICLABS*
 ### 2. AI Bounty Prompt Enhancer (4-Stage Workflow)
 Bukan generator template statis — setiap klik **Enhance with AI** menjalankan pipeline 4 tahap di backend:
 1. **Stage 1 — Official Context Verification**: Mengambil prompt resmi verbatim (atau manual override terverifikasi bila API tidak lengkap), aturan, deliverables, dan active gate checks.
-2. **Stage 2 — Read-Only Research & Grounding**: Menjalankan Google Search Grounding (bila diaktifkan & tersedia) dengan fallback otomatis gratis ke GitHub Public Search API dan Wikipedia API + inspeksi manifest Competition Kit make.fun.
+2. **Stage 2 — Read-Only Research**: Menggunakan GitHub Public Search API dan Wikipedia API serta memeriksa manifest Competition Kit make.fun.
 3. **Stage 3 — Category-Adapted Synthesis**: LLM menyusun strategi teknis/kreatif khusus kategori bounty, priority matrix berdasarkan kriteria penilaian, risiko, asumsi, instruksi Part 2 & Part 3, serta rekomendasi skill agen (**Agent Skill Stack**).
-4. **Stage 4 — Compliance Verification & Master Markdown Assembly**: Memverifikasi kepatuhan aturan, menggabungkan skill resmi + AI-curated, dan menyusun Master Prompt 3 bagian siap salin ke Hermes.
+4. **Stage 4 — Gate Coverage & Master Markdown Assembly**: Mencocokkan rencana verifikasi dari model dengan seluruh gate aktif, menandai gate yang belum tercakup (bukan mengklaim compliance pass), dan menyusun Master Prompt 3 bagian untuk ditinjau lalu disalin pengguna ke Hermes.
+
+Alur: Sync bounty → pilih bounty → refresh prompt standar dan requirements → Enhance with AI → tinjau strategi, provenance, dan gate → Copy Master Prompt. Aplikasi tidak menjalankan Hermes atau melakukan submission.
+
+- Part 1 berasal dari field prompt khusus atau elemen unik `p.crawl-body-prompt` pada halaman bounty resmi. Teks terdekode disimpan persis, termasuk CR/LF, karakter, dan whitespace awal/akhir. Brief, judul, rules, dan deliverables adalah konteks terpisah. Jika sumber persis tidak tersedia, pengguna harus menempelkan prompt dan sumber ditandai manual.
+- Setiap enhancement me-refresh detail dan requirements. Kegagalan bagian sumber ditampilkan; cache hanya dapat dipakai setelah pilihan eksplisit dan ditandai beserta waktu pengambilannya. Snapshot lama tidak ditimpa.
+- Analisis menyimpan ID/hash snapshot, hash rules, hash tepat dua message yang dikirim, waktu, provider/model, dan coverage seluruh gate. Batas konteks menolak request dengan rincian bagian, bukan memotong rules atau check diam-diam.
+- Part 1 saat Save berasal dari snapshot server. ID analisis, snapshot, dan slug divalidasi bersama. Perubahan aturan memerlukan acknowledgment sebelum reuse. Versi lama tanpa bukti provenance tetap tersedia sebagai `legacy_unverified`.
+- Interval sinkronisasi di Settings menjalankan sync berkala dengan satu run aktif, di samping tombol manual. Status keberhasilan/kegagalan terlihat dan daftar Prompt Studio diperbarui tanpa restart.
 
 ### 3. Agent Skill Playbook (Prompt Studio)
 - Menggabungkan skill/MCP resmi bounty (`official_mcp`, `official_bounty`), skill terkurasi AI (`ai_curated`), dan skill kustom Founder (`founder_custom`).
@@ -45,7 +53,7 @@ Bukan generator template statis — setiap klik **Enhance with AI** menjalankan 
 5. **Hermes Monitor** — Import/scan bukti sesi read-only dan pengecekan 9-gate transcript compliance.
 6. **Submissions** — Pelacak status entri dan peringkat kompetisi.
 7. **Rewards Analytics** — Grafik dan ledger pemantauan prize pool vs klaim aktual.
-8. **Settings** — Konfigurasi provider LLM (Gemini free-tier / paid-tier berizin eksplisit, atau endpoint OpenAI-compatible lokal), Google Search grounding, handle akun, interval sync, path evidence, dan test koneksi LLM.
+8. **Settings** — Konfigurasi model OpenAI-compatible, handle akun, interval sync, path evidence, dan tes koneksi LLM. URL endpoint dan API key diatur melalui environment server.
 
 ---
 
@@ -54,7 +62,7 @@ Bukan generator template statis — setiap klik **Enhance with AI** menjalankan 
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Lucide Icons, Recharts
 - **Backend Server**: Express (`tsx server.ts`) terintegrasi dengan Vite middleware di development
 - **Database & ORM**: SQLite (`better-sqlite3`) + Drizzle ORM (`drizzle-orm` / `drizzle-kit`)
-- **LLM SDK**: `@google/genai` (server-side) & OpenAI-compatible HTTP client
+- **LLM**: OpenAI-compatible HTTP client di server, dengan deadline, pembatasan ukuran respons, concurrency, dan rate limit
 - **Validasi**: Zod
 
 ---
@@ -107,20 +115,37 @@ Database tersimpan lokal di `./data/cosmiclabs.db` dan otomatis diinisialisasi s
 
 ## Konfigurasi Environment
 
-Salin `.env.example` atau atur environment variable pada runtime/Secrets:
+Salin `.env.example` ke `.env` atau atur environment variable pada runtime server. Restart server setelah mengubah konfigurasi:
 
 ```env
-# Wajib jika menggunakan provider Google Gemini (dikelola di server-side)
-GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
-
-# Opsional jika menggunakan endpoint OpenAI-compatible lokal/eksternal yang memerlukan Bearer token
-OPENAI_COMPAT_API_KEY=""
-
-# Opsional (default: 3000)
+HOST=127.0.0.1
 PORT=3000
+OPENAI_COMPAT_API_KEY=""
+OPENAI_COMPAT_BASE_URL="http://localhost:11434/v1"
+LLM_ALLOW_PAID_REQUESTS=false
+LLM_REQUEST_TIMEOUT_MS=60000
+LLM_MAX_RESPONSE_BYTES=1048576
+LLM_MAX_CONCURRENT_REQUESTS=2
+LLM_MAX_REQUESTS_PER_MINUTE=10
 ```
 
-> **Catatan Keamanan & Biaya**: API key hanya dibaca di sisi server (`server/llm.ts`). Model Gemini berbayar (`gemini-4-argon`, `gemini-4-carbon`) diblokir secara default hingga Founder mengaktifkan otorisasi eksplisit di halaman **Settings**. Model free-tier default adalah `gemini-4-hydrogen` dan `gemini-3.1-flash-lite`.
+| Variable | Fungsi |
+| --- | --- |
+| `HOST` | Default `127.0.0.1`. Hanya `127.0.0.1`, `::1`, dan `localhost` diterima; bind ke jaringan remote belum didukung. |
+| `PORT` | Port HTTP lokal, default `3000`, bilangan bulat 1–65535. |
+| `OPENAI_COMPAT_API_KEY` | Bearer token server untuk endpoint kompatibel bila diperlukan; Ollama lokal biasanya tidak memerlukan key. |
+| `OPENAI_COMPAT_BASE_URL` | Satu endpoint yang disetujui server, default `http://localhost:11434/v1`. Hanya HTTP(S), tanpa username/password, query, atau fragment. Settings menampilkan URL efektif ini secara read-only; nilai lama di SQLite tidak menentukan tujuan request. |
+| `LLM_ALLOW_PAID_REQUESTS` | Tetapkan `true` untuk mengizinkan request ke endpoint HTTPS publik yang ditetapkan server. Default `false` membatasi request LLM ke endpoint loopback. |
+| `LLM_REQUEST_TIMEOUT_MS` | Batas waktu request LLM dalam milidetik. |
+| `LLM_MAX_RESPONSE_BYTES` | Batas ukuran respons provider dalam byte. |
+| `LLM_MAX_CONCURRENT_REQUESTS` | Batas request LLM aktif bersamaan. |
+| `LLM_MAX_REQUESTS_PER_MINUTE` | Batas request LLM per menit untuk proses server ini. |
+| `LLM_MAX_CONTEXT_CHARS` | Batas karakter dua message lengkap yang akan dikirim, default 400000. Request yang terlalu besar ditolak dengan rincian bagian dan gate. |
+| `LLM_MAX_COMPLETION_TOKENS` | Opsional, batas output model melalui `max_tokens`; sesuaikan dukungan provider. |
+
+**Keamanan & biaya:** API key hanya dibaca di server; jangan masukkan secret dalam textbox UI atau URL endpoint dan jangan commit `.env`. Halaman Settings bukan penyimpanan secret. Biaya dan kuota untuk enhancement dan tes koneksi mengikuti model serta akun provider. Verifikasi harga dan kuota dengan provider sebelum request. Pembatasan proses juga berlaku untuk test koneksi.
+
+API lokal memeriksa `Host` loopback untuk mencegah DNS rebinding dan menolak `Origin` asing. Request browser harus berasal dari origin HTTP yang sama persis; request CLI tanpa `Origin` diperbolehkan. Body pada metode POST/PATCH/PUT/DELETE harus `Content-Type: application/json`; aksi tanpa body tetap didukung. Jangan publikasikan aplikasi melalui tunnel atau reverse proxy: autentikasi akses remote belum tersedia.
 
 ---
 
@@ -137,7 +162,7 @@ bun install
 ```bash
 bun run dev
 ```
-Aplikasi tersedia di `http://localhost:3000`.
+Aplikasi tersedia di `http://127.0.0.1:3000` secara default. Jika memakai `HOST=::1`, buka `http://[::1]:3000`.
 
 ### 3. Typecheck, Build Produksi, dan Unit Test
 ```bash
@@ -148,7 +173,9 @@ bun run lint
 bun run build
 
 # Jalankan unit test (skill builder, transcript gate, dan Drizzle CRUD)
-bunx tsx --test tests/command-center.test.ts tests/crud.test.ts
+# Isolasi database default saat semua test berjalan paralel.
+# PowerShell: $env:COSMICLABS_DB_PATH=':memory:'
+COSMICLABS_DB_PATH=:memory: bun x tsx --test tests/*.test.ts
 ```
 
 ### 4. Menjalankan Mode Produksi

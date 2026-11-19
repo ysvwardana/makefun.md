@@ -3,15 +3,18 @@ import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import fs from 'fs';
 import path from 'path';
 import { drizzleSchema } from './schema.ts';
+import { renderGateChecklist } from './enhancement-context.ts';
 import type {
   AIAnalysisRecord,
   BountyRecord,
   BountySnapshot,
+  AnalysisEvidence,
   HermesEvidenceRecord,
   LLMProviderId,
   ModelOption,
   PrerequisitesData,
   PromptDraftRecord,
+  PromptSource,
   PromptVersionRecord,
   RecommendedSkill,
   RewardRecord,
@@ -33,48 +36,17 @@ export type CommandCenterDatabase = BetterSQLite3Database<typeof drizzleSchema>;
 
 export const AVAILABLE_MODELS: ModelOption[] = [
   {
-    id: 'gemini-4-hydrogen',
-    label: 'Gemini 4 Hydrogen',
-    provider: 'gemini',
-    tier: 'free',
-    description: 'Default free-tier Gemini 4 model with high-speed reasoning and Google Search grounding.',
-    supportsGrounding: true,
-  },
-  {
-    id: 'gemini-3.1-flash-lite',
-    label: 'Gemini 3.1 Flash Lite',
-    provider: 'gemini',
-    tier: 'free',
-    description: 'Lightweight free-tier Gemini model for rapid drafting and analysis.',
-    supportsGrounding: true,
-  },
-  {
-    id: 'gemini-4-argon',
-    label: 'Gemini 4 Argon',
-    provider: 'gemini',
-    tier: 'paid',
-    description: 'Paid-tier complex reasoning, coding, and algorithm model (requires explicit paid authorization).',
-    supportsGrounding: true,
-  },
-  {
-    id: 'gemini-4-carbon',
-    label: 'Gemini 4 Carbon',
-    provider: 'gemini',
-    tier: 'paid',
-    description: 'Paid-tier deep architectural and security reasoning model (requires explicit paid authorization).',
-    supportsGrounding: true,
-  },
-  {
     id: 'openai-compatible-custom',
     label: 'OpenAI-Compatible Endpoint',
     provider: 'openai_compatible',
     tier: 'free',
-    description: 'Local or free OpenAI-compatible server (e.g., Ollama, vLLM, OpenRouter free models).',
+    description: 'Server-configured OpenAI-compatible endpoint (local or hosted; provider pricing may apply).',
     supportsGrounding: false,
   },
 ];
 
 export function initSqliteSchema(sqlite: Database.Database): void {
+  sqlite.pragma('busy_timeout = 5000');
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');
 
@@ -116,6 +88,10 @@ export function initSqliteSchema(sqlite: Database.Database): void {
       raw_kit_json TEXT,
       official_prompt_text TEXT NOT NULL DEFAULT '',
       manual_prompt_override TEXT,
+       prompt_source_json TEXT,
+       refresh_issues_json TEXT,
+       requirements_complete INTEGER NOT NULL DEFAULT 0,
+       rules_hash TEXT NOT NULL DEFAULT '',
       fetched_at TEXT NOT NULL,
       content_hash TEXT NOT NULL,
       FOREIGN KEY (bounty_slug) REFERENCES bounties(slug) ON DELETE CASCADE
@@ -146,6 +122,7 @@ export function initSqliteSchema(sqlite: Database.Database): void {
       research_references_json TEXT NOT NULL,
       research_disclosures TEXT NOT NULL DEFAULT '',
       recommended_skills_json TEXT,
+       evidence_json TEXT,
       raw_llm_response TEXT NOT NULL DEFAULT '',
       token_usage_json TEXT,
       created_at TEXT NOT NULL,
@@ -172,6 +149,9 @@ export function initSqliteSchema(sqlite: Database.Database): void {
       bounty_slug TEXT NOT NULL,
       version_number INTEGER NOT NULL,
       analysis_id TEXT,
+       source_snapshot_id INTEGER,
+       source_rules_hash TEXT,
+       provenance_status TEXT NOT NULL DEFAULT 'legacy_unverified',
       part1_original_prompt TEXT NOT NULL,
       part2_ai_enhancement TEXT NOT NULL,
       part3_execution_guidelines TEXT NOT NULL,
@@ -233,27 +213,40 @@ export function initSqliteSchema(sqlite: Database.Database): void {
     );
   `);
 
-  // Safe incremental schema migrations for existing SQLite DBs
+  // Serialize incremental DDL so concurrent application/test connections cannot race ALTER TABLE.
+  const migrateColumns = sqlite.transaction(() => {
   const bountyCols = sqlite.prepare('PRAGMA table_info(bounties)').all() as Array<{ name: string }>;
   if (!bountyCols.some((c) => c.name === 'prerequisites_json')) {
     sqlite.exec('ALTER TABLE bounties ADD COLUMN prerequisites_json TEXT');
   }
-  const analysisCols = sqlite.prepare('PRAGMA table_info(ai_analyses)').all() as Array<{ name: string }>;
-  if (!analysisCols.some((c) => c.name === 'recommended_skills_json')) {
-    sqlite.exec('ALTER TABLE ai_analyses ADD COLUMN recommended_skills_json TEXT');
-  }
-  const versionCols = sqlite.prepare('PRAGMA table_info(prompt_versions)').all() as Array<{ name: string }>;
-  if (!versionCols.some((c) => c.name === 'selected_skills_json')) {
-    sqlite.exec('ALTER TABLE prompt_versions ADD COLUMN selected_skills_json TEXT');
-  }
+  const addMissingColumns = (table: string, columns: Record<string, string>) => {
+    const existing = new Set(
+      (sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    for (const [name, definition] of Object.entries(columns)) {
+      if (!existing.has(name)) sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+    }
+  };
+  addMissingColumns('bounty_snapshots', {
+    prompt_source_json: 'TEXT',
+    refresh_issues_json: 'TEXT',
+    requirements_complete: 'INTEGER NOT NULL DEFAULT 0',
+    rules_hash: "TEXT NOT NULL DEFAULT ''",
+  });
+  addMissingColumns('ai_analyses', {
+    recommended_skills_json: 'TEXT',
+    evidence_json: 'TEXT',
+  });
+  addMissingColumns('prompt_versions', {
+    selected_skills_json: 'TEXT',
+    source_snapshot_id: 'INTEGER',
+    source_rules_hash: 'TEXT',
+    provenance_status: "TEXT NOT NULL DEFAULT 'legacy_unverified'",
+  });
 
   const defaults: Record<string, string> = {
-    provider: 'gemini',
-    model: 'gemini-4-hydrogen',
-    openaiCompatBaseUrl: 'http://localhost:11434/v1',
-    openaiCompatModel: 'llama3.1:8b',
-    allowPaidRequests: 'false',
-    enableSearchGrounding: 'true',
+    provider: 'openai_compatible',
+    openaiCompatModel: 'cx/gpt-6.1-sol',
     syncIntervalMinutes: '30',
     accountHandle: '@0xkeinara',
     permittedEvidencePaths: JSON.stringify(['./evidence']),
@@ -267,6 +260,10 @@ export function initSqliteSchema(sqlite: Database.Database): void {
   for (const [key, value] of Object.entries(defaults)) {
     insertSetting.run(key, value);
   }
+  sqlite.prepare('UPDATE app_settings SET value = ? WHERE key = ? AND value <> ?')
+    .run(defaults.provider, 'provider', defaults.provider);
+  });
+  migrateColumns.immediate();
 }
 
 export function createDatabaseConnection(dbFilePath?: string): {
@@ -344,12 +341,28 @@ export function mapSnapshotRecord(row: BountySnapshotSelectRow): BountySnapshot 
     rawKit: safeJsonParse(row.rawKitJson, null),
     officialPromptText: row.officialPromptText || '',
     manualPromptOverride: row.manualPromptOverride ?? null,
+    promptSource: safeJsonParse<PromptSource | null>(row.promptSourceJson, null),
+    refreshIssues: safeJsonParse<string[]>(row.refreshIssuesJson, []),
+    requirementsComplete: Boolean(row.requirementsComplete),
+    rulesHash: row.rulesHash || '',
     fetchedAt: row.fetchedAt,
     contentHash: row.contentHash,
   };
 }
 
 export function mapAnalysisRecord(row: AIAnalysisSelectRow): AIAnalysisRecord {
+  const evidence = safeJsonParse<AnalysisEvidence | null>(row.evidenceJson, null);
+  let recovered: { part2AiEnhancement: string; part3ExecutionGuidelines: string } | null = null;
+  if (evidence) {
+    const raw = safeJsonParse<Record<string, unknown> | null>(row.rawLlmResponse, null);
+    if (typeof raw?.part2AiEnhancement === 'string' && typeof raw?.part3ExecutionGuidelines === 'string') {
+      const claims = /\b(guarantee[sd]?\s+(to\s+)?win|100%\s+win|guaranteed\s+victory)\b/gi;
+      recovered = {
+        part2AiEnhancement: raw.part2AiEnhancement.replace(claims, 'aims to improve competitive positioning'),
+        part3ExecutionGuidelines: raw.part3ExecutionGuidelines.replace(claims, 'aims to improve compliance and quality') + '\n\n' + renderGateChecklist(evidence.gateCoverage),
+      };
+    }
+  }
   return {
     id: row.id,
     bountySlug: row.bountySlug,
@@ -372,6 +385,9 @@ export function mapAnalysisRecord(row: AIAnalysisSelectRow): AIAnalysisRecord {
     researchReferences: safeJsonParse(row.researchReferencesJson, []),
     researchDisclosures: row.researchDisclosures || '',
     recommendedSkills: safeJsonParse<RecommendedSkill[]>(row.recommendedSkillsJson, []),
+    evidence,
+    part2AiEnhancement: recovered?.part2AiEnhancement ?? null,
+    part3ExecutionGuidelines: recovered?.part3ExecutionGuidelines ?? null,
     tokenUsage: safeJsonParse(row.tokenUsageJson, null),
     createdAt: row.createdAt,
   };
@@ -384,6 +400,9 @@ export function mapPromptVersionRecord(row: PromptVersionSelectRow): PromptVersi
     bountySlug: row.bountySlug,
     versionNumber: Number(row.versionNumber),
     analysisId: row.analysisId ?? null,
+    sourceSnapshotId: row.sourceSnapshotId ?? null,
+    sourceRulesHash: row.sourceRulesHash ?? null,
+    provenanceStatus: row.provenanceStatus === 'verified' ? 'verified' : 'legacy_unverified',
     part1OriginalPrompt: row.part1OriginalPrompt,
     part2AiEnhancement: row.part2AiEnhancement,
     part3ExecutionGuidelines: row.part3ExecutionGuidelines,
